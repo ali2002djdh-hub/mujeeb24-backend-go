@@ -32,7 +32,7 @@ import (
 const (
 	defaultMaxOutputTokens = 2048
 	defaultBaseURL         = "https://generativelanguage.googleapis.com"
-	defaultModel           = "gemini-3.5-flash-lite"
+	defaultModel           = "gemini-3.8-flash"
 )
 
 // GeminiHTTPClientConfig contains only runtime configuration. API keys are never copied
@@ -91,7 +91,7 @@ func NewGeminiHTTPClient(cfg GeminiHTTPClientConfig) (*GeminiHTTPClient, error) 
 	}
 	maxInputCharacters := cfg.MaxInputCharacters
 	if maxInputCharacters <= 0 {
-		maxInputCharacters = 12000
+		maxInputCharacters = 48000
 	}
 	client := cfg.HTTPClient
 	if client == nil {

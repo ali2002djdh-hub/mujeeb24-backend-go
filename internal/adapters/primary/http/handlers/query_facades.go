@@ -640,7 +640,7 @@ func variantList(v commands.ListResult[commands.VariantView]) *contract.List[con
 func attributeSchemaProjection(v commands.AttributeSchemaView) contract.AttributeSchema {
 	definitions := make([]contract.AttributeDefinition, 0, len(v.Definitions))
 	for _, item := range v.Definitions {
-		definitions = append(definitions, contract.AttributeDefinition{ID: contract.UUID(item.ID), Key: item.Key, Label: item.Label, DataType: item.DataType, Required: item.Required, Searchable: item.Searchable, DisplayOrder: item.DisplayOrder})
+		definitions = append(definitions, contract.AttributeDefinition{ID: contract.UUID(item.ID), Key: item.Key, Label: item.Label, DataType: item.DataType, Required: item.Required, ValidationRules: item.ValidationRules, DisplayOrder: item.DisplayOrder})
 	}
 	return contract.AttributeSchema{ID: contract.UUID(v.ID), BusinessID: contract.UUID(v.BusinessID), Name: v.Name, Version: v.Version, Definitions: definitions}
 }

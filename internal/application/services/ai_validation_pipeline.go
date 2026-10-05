@@ -56,9 +56,9 @@ type ValidationPipeline struct {
 }
 
 // NewValidationPipeline wires the pipeline dependencies. Each may be nil if
-// the deployment does not yet implement that stage; the pipeline will treat a
-// nil stage as "always passes" with a logged warning, allowing incremental
-// rollout per contract ⑥.
+// Reference, tenant and policy stages are mandatory for Customer Sales.
+// Missing mandatory stages fail closed. AuthorizationService may remain nil
+// only when the merchant policy decision is intentionally the final authority.
 func NewValidationPipeline(
 	rv ReferenceValidator,
 	tv TenantValidator,
@@ -146,6 +146,34 @@ func (p *ValidationPipeline) validateStructural(proposal ports.CustomerSalesProp
 			Reason:   fmt.Sprintf("invalid action %q per contract ④ §4", proposal.Action),
 		}
 	}
+	if proposal.RoutingReason != "" {
+		switch proposal.RoutingReason {
+		case ports.CustomerSalesRoutingReasonSubscriptionActivation,
+			ports.CustomerSalesRoutingReasonCustomerRequestedHuman,
+			ports.CustomerSalesRoutingReasonOther:
+			// allowed
+		default:
+			return &StageFailure{
+				Stage:    ports.AIRunFailureStageValidation,
+				Category: ports.AIRunFailureCategoryInvalidAIOutput,
+				Reason:   fmt.Sprintf("invalid routing_reason %q", proposal.RoutingReason),
+			}
+		}
+	}
+	if proposal.RoutingReason != "" && proposal.Action != ports.CustomerSalesProposalActionHumanRequest {
+		return &StageFailure{
+			Stage:    ports.AIRunFailureStageValidation,
+			Category: ports.AIRunFailureCategoryInvalidAIOutput,
+			Reason:   "routing_reason is only valid with action=human_request",
+		}
+	}
+	if proposal.Status == ports.CustomerSalesProposalStatusNotFound && len(proposal.Selected) > 0 {
+		return &StageFailure{
+			Stage:    ports.AIRunFailureStageValidation,
+			Category: ports.AIRunFailureCategoryInvalidAIOutput,
+			Reason:   "not_found proposal must not contain selected catalog references",
+		}
+	}
 	if proposal.Action != ports.CustomerSalesProposalActionHumanRequest && strings.TrimSpace(proposal.ResponseText) == "" {
 		return &StageFailure{
 			Stage:    ports.AIRunFailureStageValidation,
@@ -171,32 +199,42 @@ func (p *ValidationPipeline) validateStructural(proposal ports.CustomerSalesProp
 // if it wasn't in the evidence sent.
 func (p *ValidationPipeline) validateReferences(ctx context.Context, input ValidationInput) *StageFailure {
 	if p.ReferenceValidator == nil {
-		return nil
-	}
-	for i, ref := range input.Proposal.Selected {
-		if err := p.ReferenceValidator.ValidateItemReference(ctx, input.BusinessID, ref.ItemID, input.EvidenceItemIDs); err != nil {
-			return &StageFailure{
-				Stage:    ports.AIRunFailureStageValidation,
-				Category: ports.AIRunFailureCategoryInvalidReference,
-				Reason:   fmt.Sprintf("selected[%d].item_id %s: %s per contract ⑥ §6", i, ref.ItemID, err.Error()),
-			}
+		return &StageFailure{
+			Stage:    ports.AIRunFailureStageValidation,
+			Category: ports.AIRunFailureCategoryInvalidReference,
+			Reason:   "reference validator is required; validation fails closed",
 		}
-		if ref.VariantID != nil && *ref.VariantID != "" {
-			if err := p.ReferenceValidator.ValidateVariantReference(ctx, input.BusinessID, *ref.VariantID, input.EvidenceVariantIDs); err != nil {
+	}
+
+	// Universal Catalog AI v3 validates the complete item -> variant -> offer
+	// relationship against the exact evidence exposed to the model.
+	if relational, ok := p.ReferenceValidator.(RelationalReferenceValidator); ok {
+		for i, ref := range input.Proposal.Selected {
+			if err := relational.ValidateSelection(ctx, input.BusinessID, ref, input.Evidence); err != nil {
 				return &StageFailure{
 					Stage:    ports.AIRunFailureStageValidation,
 					Category: ports.AIRunFailureCategoryInvalidReference,
-					Reason:   fmt.Sprintf("selected[%d].variant_id %s: %s", i, *ref.VariantID, err.Error()),
+					Reason:   fmt.Sprintf("selected[%d]: %s", i, err.Error()),
 				}
+			}
+		}
+		return nil
+	}
+
+	// Compatibility path for older validators/tests. Production Postgres
+	// implements RelationalReferenceValidator and never reaches this path.
+	for i, ref := range input.Proposal.Selected {
+		if err := p.ReferenceValidator.ValidateItemReference(ctx, input.BusinessID, ref.ItemID, input.EvidenceItemIDs); err != nil {
+			return &StageFailure{Stage: ports.AIRunFailureStageValidation, Category: ports.AIRunFailureCategoryInvalidReference, Reason: fmt.Sprintf("selected[%d].item_id %s: %s", i, ref.ItemID, err.Error())}
+		}
+		if ref.VariantID != nil && *ref.VariantID != "" {
+			if err := p.ReferenceValidator.ValidateVariantReference(ctx, input.BusinessID, *ref.VariantID, input.EvidenceVariantIDs); err != nil {
+				return &StageFailure{Stage: ports.AIRunFailureStageValidation, Category: ports.AIRunFailureCategoryInvalidReference, Reason: fmt.Sprintf("selected[%d].variant_id %s: %s", i, *ref.VariantID, err.Error())}
 			}
 		}
 		if ref.OfferID != nil && *ref.OfferID != "" {
 			if err := p.ReferenceValidator.ValidateOfferReference(ctx, input.BusinessID, *ref.OfferID, input.EvidenceOfferIDs); err != nil {
-				return &StageFailure{
-					Stage:    ports.AIRunFailureStageValidation,
-					Category: ports.AIRunFailureCategoryInvalidReference,
-					Reason:   fmt.Sprintf("selected[%d].offer_id %s: %s", i, *ref.OfferID, err.Error()),
-				}
+				return &StageFailure{Stage: ports.AIRunFailureStageValidation, Category: ports.AIRunFailureCategoryInvalidReference, Reason: fmt.Sprintf("selected[%d].offer_id %s: %s", i, *ref.OfferID, err.Error())}
 			}
 		}
 	}
@@ -212,7 +250,11 @@ func (p *ValidationPipeline) validateReferences(ctx context.Context, input Valid
 // leak its existence).
 func (p *ValidationPipeline) validateTenant(ctx context.Context, input ValidationInput) *StageFailure {
 	if p.TenantValidator == nil {
-		return nil
+		return &StageFailure{
+			Stage:    ports.AIRunFailureStageValidation,
+			Category: ports.AIRunFailureCategoryTenantViolation,
+			Reason:   "tenant validator is required; validation fails closed",
+		}
 	}
 	for i, ref := range input.Proposal.Selected {
 		if err := p.TenantValidator.ValidateItemOwnership(ctx, input.BusinessID, ref.ItemID); err != nil {
@@ -249,18 +291,25 @@ func (p *ValidationPipeline) validateTenant(ctx context.Context, input Validatio
 // Gemini only proposes; policy never re-interprets customer intent.
 func (p *ValidationPipeline) evaluateCustomerSalesPolicy(ctx context.Context, input ValidationInput) (ports.EffectiveDecision, *StageFailure) {
 	if p.CustomerSalesPolicy == nil {
-		return ports.EffectiveDecision{
-			DecisionID:      input.DecisionID,
-			EffectiveAction: string(input.Proposal.Action),
-			PolicyDecision:  "allowed",
-			Reason:          "no customer sales policy configured; defaulting to allowed per contract ⑥ §12",
-		}, nil
+		return ports.EffectiveDecision{}, &StageFailure{
+			Stage:    ports.AIRunFailureStagePolicy,
+			Category: ports.AIRunFailureCategoryPolicyDenial,
+			Reason:   "customer sales policy evaluator is required; policy fails closed",
+		}
 	}
 
 	result := p.CustomerSalesPolicy.Evaluate(ctx, input.Proposal, input.Context)
 	policyDecision := strings.TrimSpace(result.Decision)
-	if policyDecision == "" {
-		policyDecision = "allowed"
+	switch policyDecision {
+	case "allowed", "requires_approval", "denied":
+		// closed policy decision set
+	default:
+		// A broken/missing policy decision must never become implicit execution.
+		// Route to human review instead of failing open.
+		policyDecision = "requires_approval"
+		if strings.TrimSpace(result.Reason) == "" {
+			result.Reason = "policy evaluator returned an empty or unsupported decision; requiring human approval"
+		}
 	}
 
 	return ports.EffectiveDecision{
@@ -314,6 +363,9 @@ type ValidationInput struct {
 	// Context is the CustomerSalesContext built by the ContextBuilder.
 	Context *ports.CustomerSalesContext
 
+	// Evidence is the exact relational catalog evidence exposed to Gemini.
+	Evidence ports.CatalogAIEvidenceSet
+
 	// EvidenceItemIDs is the set of item IDs that were actually sent to
 	// Gemini as evidence. Used by ReferenceValidator per contract ⑥ §10.
 	EvidenceItemIDs []string
@@ -331,6 +383,10 @@ type ReferenceValidator interface {
 	ValidateItemReference(ctx context.Context, businessID, itemID string, evidenceItemIDs []string) error
 	ValidateVariantReference(ctx context.Context, businessID, variantID string, evidenceVariantIDs []string) error
 	ValidateOfferReference(ctx context.Context, businessID, offerID string, evidenceOfferIDs []string) error
+}
+
+type RelationalReferenceValidator interface {
+	ValidateSelection(ctx context.Context, businessID string, selected ports.SelectedReference, evidence ports.CatalogAIEvidenceSet) error
 }
 
 // TenantValidator is the contract ⑥ §8 ownership check.

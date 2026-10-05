@@ -44,6 +44,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/Ammar777782439/mujeeb24-backend-go/internal/application/ports"
 	"github.com/jackc/pgx/v5"
 )
 
@@ -63,6 +64,81 @@ type PostgresReferenceValidator struct{ adapter *Adapter }
 // NewPostgresReferenceValidator wires the validator to a Postgres Adapter.
 func NewPostgresReferenceValidator(adapter *Adapter) *PostgresReferenceValidator {
 	return &PostgresReferenceValidator{adapter: adapter}
+}
+
+// ValidateSelection validates the complete item -> variant -> offer tuple.
+// It first checks the exact relational evidence exposed to Gemini, then checks
+// the same relationship in PostgreSQL under the trusted business scope.
+func (v *PostgresReferenceValidator) ValidateSelection(ctx context.Context, businessID string, selected ports.SelectedReference, evidence ports.CatalogAIEvidenceSet) error {
+	if v == nil || v.adapter == nil {
+		return ErrPoolClosed
+	}
+	if strings.TrimSpace(businessID) == "" || strings.TrimSpace(selected.ItemID) == "" {
+		return &RepositoryError{Operation: "validator.reference.selection", Kind: RepositoryInvalid, Err: errors.New("business_id and item_id are required")}
+	}
+	if !evidence.ContainsSelection(selected) {
+		return &RepositoryError{
+			Operation: "validator.reference.selection",
+			Kind:      RepositoryInvalid,
+			Err:       errors.New("selected catalog relationship was not in the evidence sent to Gemini"),
+		}
+	}
+
+	var variantID, offerID string
+	if selected.VariantID != nil {
+		variantID = strings.TrimSpace(*selected.VariantID)
+	}
+	if selected.OfferID != nil {
+		offerID = strings.TrimSpace(*selected.OfferID)
+	}
+
+	executor, err := v.adapter.Executor(ctx)
+	if err != nil {
+		return &RepositoryError{Operation: "validator.reference.selection", Kind: RepositoryInvalid, Err: err}
+	}
+	var valid bool
+	const query = `
+		SELECT EXISTS (
+			SELECT 1
+			FROM catalog_items i
+			JOIN catalogs c
+			  ON c.business_id = i.business_id
+			 AND c.id = i.catalog_id
+			 AND c.status = 'active'
+			WHERE i.business_id::text = $1
+			  AND i.id::text = $2
+			  AND i.status = 'active'
+			  AND (
+			    $3 = '' OR EXISTS (
+			      SELECT 1 FROM variants v
+			      WHERE v.business_id = i.business_id
+			        AND v.catalog_item_id = i.id
+			        AND v.id::text = $3
+			        AND v.status = 'active'
+			    )
+			  )
+			  AND (
+			    $4 = '' OR EXISTS (
+			      SELECT 1 FROM offers o
+			      WHERE o.business_id = i.business_id
+			        AND o.catalog_item_id = i.id
+			        AND o.id::text = $4
+			        AND o.status = 'active'
+			        AND (
+			          $3 = '' OR o.variant_id IS NULL OR o.variant_id::text = $3
+			        )
+			    )
+			  )
+		)`
+	if err := executor.QueryRow(ctx, query, businessID, selected.ItemID, variantID, offerID).Scan(&valid); err != nil {
+		return &RepositoryError{Operation: "validator.reference.selection", Kind: RepositoryInvalid, Err: fmt.Errorf("query selected catalog relationship: %w", err)}
+	}
+	if !valid {
+		// Deliberately generic: do not disclose whether another tenant owns
+		// any of the supplied identifiers.
+		return &RepositoryError{Operation: "validator.reference.selection", Kind: RepositoryNotFound, Err: errors.New("selected catalog relationship is not valid in the current business")}
+	}
+	return nil
 }
 
 // ValidateItemReference per contract ⑥ §6-7 + §10.
@@ -103,7 +179,13 @@ func (v *PostgresReferenceValidator) ValidateItemReference(ctx context.Context, 
 		return &RepositoryError{Operation: "validator.reference.item", Kind: RepositoryInvalid, Err: err}
 	}
 	var exists bool
-	const query = `SELECT EXISTS(SELECT 1 FROM catalog_items WHERE id::text = $1 AND business_id::text = $2)`
+	const query = `SELECT EXISTS(
+		SELECT 1
+		FROM catalog_items i
+		JOIN catalogs c ON c.business_id=i.business_id AND c.id=i.catalog_id
+		WHERE i.id::text=$1 AND i.business_id::text=$2
+		  AND i.status='active' AND c.status='active'
+	)`
 	if err := executor.QueryRow(ctx, query, itemID, businessID).Scan(&exists); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return &RepositoryError{Operation: "validator.reference.item", Kind: RepositoryNotFound, Err: fmt.Errorf("item_id %s not found in business %s per contract ⑥ §6", itemID, businessID)}
@@ -149,7 +231,14 @@ func (v *PostgresReferenceValidator) ValidateVariantReference(ctx context.Contex
 		return &RepositoryError{Operation: "validator.reference.variant", Kind: RepositoryInvalid, Err: err}
 	}
 	var exists bool
-	const query = `SELECT EXISTS(SELECT 1 FROM variants WHERE id::text = $1 AND business_id::text = $2)`
+	const query = `SELECT EXISTS(
+		SELECT 1
+		FROM variants v
+		JOIN catalog_items i ON i.business_id=v.business_id AND i.id=v.catalog_item_id
+		JOIN catalogs c ON c.business_id=i.business_id AND c.id=i.catalog_id
+		WHERE v.id::text=$1 AND v.business_id::text=$2
+		  AND v.status='active' AND i.status='active' AND c.status='active'
+	)`
 	if err := executor.QueryRow(ctx, query, variantID, businessID).Scan(&exists); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return &RepositoryError{Operation: "validator.reference.variant", Kind: RepositoryNotFound, Err: fmt.Errorf("variant_id %s not found in business %s per contract ⑥ §6", variantID, businessID)}
@@ -193,7 +282,14 @@ func (v *PostgresReferenceValidator) ValidateOfferReference(ctx context.Context,
 		return &RepositoryError{Operation: "validator.reference.offer", Kind: RepositoryInvalid, Err: err}
 	}
 	var exists bool
-	const query = `SELECT EXISTS(SELECT 1 FROM offers WHERE id::text = $1 AND business_id::text = $2)`
+	const query = `SELECT EXISTS(
+		SELECT 1
+		FROM offers o
+		JOIN catalog_items i ON i.business_id=o.business_id AND i.id=o.catalog_item_id
+		JOIN catalogs c ON c.business_id=i.business_id AND c.id=i.catalog_id
+		WHERE o.id::text=$1 AND o.business_id::text=$2
+		  AND o.status='active' AND i.status='active' AND c.status='active'
+	)`
 	if err := executor.QueryRow(ctx, query, offerID, businessID).Scan(&exists); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return &RepositoryError{Operation: "validator.reference.offer", Kind: RepositoryNotFound, Err: fmt.Errorf("offer_id %s not found in business %s per contract ⑥ §6", offerID, businessID)}

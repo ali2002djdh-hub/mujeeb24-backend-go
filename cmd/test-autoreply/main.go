@@ -7,12 +7,13 @@
 //
 //	DATABASE_URL=postgres://mujeeb:pass@localhost:5433/mujeeb24?sslmode=disable \
 //	GEMINI_API_KEY=your-key \
-//	GEMINI_MODEL=gemini-3.5-flash-lite \
+//	GEMINI_MODEL=gemini-3.8-flash \
 //	go run cmd/test-autoreply/main.go
 package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"time"
@@ -29,7 +30,7 @@ import (
 func main() {
 	businessID := envOr("TEST_BUSINESS_ID", "00000000-0000-0000-0000-000000000002")
 	apiKey := envOr("GEMINI_API_KEY", "")
-	model := envOr("GEMINI_MODEL", "gemini-3.5-flash-lite")
+	model := envOr("GEMINI_MODEL", "gemini-3.8-flash")
 	dbURL := envOr("DATABASE_URL", "")
 
 	if apiKey == "" {
@@ -152,21 +153,7 @@ func main() {
 		os.Exit(1)
 	}
 	catalogRepository := postgres.NewCatalogRepository(adapter)
-	capabilityRegistry := services.NewCustomerSalesToolRegistry()
-	catalogCapability := services.NewCustomerSalesCatalogDataTool(
-		services.ListCatalogsQueryService{Repository: catalogRepository},
-		services.ListCatalogItemsQueryService{Repository: catalogRepository},
-		services.GetCatalogItemQueryService{Repository: catalogRepository},
-		services.ListOffersQueryService{Repository: catalogRepository},
-		services.ListVariantsQueryService{Repository: catalogRepository},
-		services.GetAttributeSchemaQueryService{Repository: catalogRepository},
-	)
-	if err := capabilityRegistry.Register(catalogCapability); err != nil {
-		fmt.Printf("  ❌ Customer sales capability registry: %v\n", err)
-		os.Exit(1)
-	}
-
-	contractClient, err := gemini.NewGeminiCustomerSalesAdapter(geminiClient, capabilityRegistry)
+	contractClient, err := gemini.NewGeminiCustomerSalesAdapter(geminiClient, nil)
 	if err != nil {
 		fmt.Printf("  ❌ GeminiCustomerSalesAdapter: %v\n", err)
 		os.Exit(1)
@@ -180,6 +167,7 @@ func main() {
 		postgres.NewCatalogRepository(adapter),
 		postgres.NewMessageRepository(adapter),
 	)
+	contextBuilder.CatalogAI = postgres.NewCatalogAIReadRepository(adapter)
 	contextBuilder.Knowledge = postgres.NewKnowledgeDocumentRepository(adapter)
 	contextBuilder.Policies = postgres.NewBusinessPolicyRepository(adapter)
 
@@ -202,6 +190,43 @@ func main() {
 	service.Conversations = postgres.NewConversationRepository(adapter)
 	service.MessageRepository = postgres.NewMessageRepository(adapter)
 	service.StateRepository = postgres.NewConversationStateRepository(adapter)
+
+	entityContractBytes, err := json.Marshal(services.BuildCatalogEntityContractPayload())
+	if err != nil {
+		fmt.Printf("  ❌ Entity contract: %v\n", err)
+		os.Exit(1)
+	}
+	service.EntityContractPayload = entityContractBytes
+
+	batchTokenCounter, err := gemini.NewTokenCounter(gemini.TokenCounterConfig{
+		BaseURL: geminiClient.BaseURL(),
+		APIKey:  geminiClient.APIKey(),
+		Model:   geminiClient.Model(),
+	})
+	if err != nil {
+		fmt.Printf("  ❌ Batch token counter: %v\n", err)
+		os.Exit(1)
+	}
+	batchClient, err := gemini.NewBatchClient(gemini.BatchClientConfig{
+		BaseURL: geminiClient.BaseURL(),
+		APIKey:  geminiClient.APIKey(),
+		Model:   geminiClient.Model(),
+	})
+	if err != nil {
+		fmt.Printf("  ❌ Batch client: %v\n", err)
+		os.Exit(1)
+	}
+	service.CatalogBatch = &services.CatalogBatchController{
+		Catalogs:          catalogRepository,
+		CatalogAI:         postgres.NewCatalogAIReadRepository(adapter),
+		ProjectionBuilder: &services.CatalogAIProjectionBuilder{},
+		TokenCounter:      batchTokenCounter,
+		Gemini:            batchClient,
+		RunRepo:           postgres.NewAIRunTraceRepository(adapter),
+		TokenBudget:       8000,
+		Now:               func() time.Time { return time.Now().UTC() },
+		NewID:             uuid.NewString,
+	}
 	fmt.Println("  ✅ AutoReplyService fully wired")
 
 	// Step 6: Call Handle

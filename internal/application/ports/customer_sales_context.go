@@ -53,6 +53,7 @@ type CustomerSalesContext struct {
 	Conversation           CustomerSalesContextConversation
 	Customer               CustomerSalesContextCustomer
 	CatalogEvidence        []CustomerSalesCatalogEvidence
+	CatalogSchemaEvidence  []CustomerSalesCatalogSchemaEvidence
 	OfferEvidence          []CustomerSalesOfferEvidence
 	VariantEvidence        []CustomerSalesVariantEvidence
 	KnowledgeEvidence      []CustomerSalesKnowledgeEvidence
@@ -63,36 +64,17 @@ type CustomerSalesContext struct {
 	ConversationState      *ConversationStateRecord
 	GeneratedAt            time.Time
 	ExpiresAt              time.Time
-	// CatalogSummary is a lightweight list of ALL active catalog items
-	// (just ID + name) so Gemini knows the full catalog exists, even
-	// though only MaxItems have full evidence. When a customer asks
-	// about a product that's in the summary but not in the detailed
-	// evidence, Gemini returns needs_more_data → triggers batch evaluation.
-	CatalogSummary []CustomerSalesCatalogSummaryEntry
+	// CatalogManifest is a bounded map of the complete active catalog shape.
+	// It tells the model which catalogs, item types and dynamic schemas exist
+	// without serializing every item on every turn. Specific commercial claims
+	// still require detailed Catalog/Variant/Offer evidence.
+	CatalogManifest *CatalogAIManifest
 	// ConversationSummary is the LLM-generated running summary of older
 	// conversation turns (everything older than the sliding window of
 	// recent messages). Per ADR-039, this is sent to Gemini alongside
 	// RecentMessages so it can understand long conversation context
 	// without us sending the full history verbatim.
 	ConversationSummary string
-	// CatalogNames per ADR-048 — list of catalog (category) names only.
-	// Sent to Gemini in the B2C flow so it can respond to "what do you have?"
-	// with a hierarchical listing: "We have: Perfumes, Electronics, Packages"
-	// without loading all item details. Names only — no IDs, no counts,
-	// no merchant data. Gemini decides when to list categories vs. products.
-	CatalogNames []string
-}
-
-// CustomerSalesCatalogSummaryEntry is a lightweight catalog item reference — just
-// enough for Gemini to know the product exists without loading full
-// evidence for every item (which would exceed token limits).
-type CustomerSalesCatalogSummaryEntry struct {
-	ID                 string `json:"id"`
-	Name               string `json:"name"`
-	CatalogName        string `json:"catalog_name,omitempty"`
-	Price              string `json:"price,omitempty"`
-	Currency           string `json:"currency,omitempty"`
-	AvailabilityStatus string `json:"availability_status,omitempty"`
 }
 
 type CustomerSalesStateProposal struct {
@@ -141,9 +123,11 @@ type CustomerSalesContextCustomer struct {
 }
 
 type CustomerSalesCatalogEvidence struct {
-	Reference        string
-	CatalogReference string
-	ItemType         string
+	Reference                string
+	CatalogReference         string
+	AttributeSchemaReference *string
+	AttributeSchemaVersion   *int
+	ItemType                 string
 	Name             string
 	Status           string
 	Attributes       []byte
@@ -163,19 +147,49 @@ type CustomerSalesCatalogEvidence struct {
 	RequiresConfirmation bool
 }
 
+type CustomerSalesCatalogSchemaEvidence struct {
+	ID          string                                           `json:"id"`
+	Name        string                                           `json:"name"`
+	Version     int                                              `json:"version"`
+	Definitions []CustomerSalesAttributeDefinitionEvidence       `json:"definitions"`
+}
+
+type CustomerSalesAttributeDefinitionEvidence struct {
+	ID              string         `json:"id"`
+	SchemaID        string         `json:"schema_id"`
+	AttributeKey    string         `json:"attribute_key"`
+	Label           string         `json:"label"`
+	DataType        string         `json:"data_type"`
+	IsRequired      bool           `json:"is_required"`
+	ValidationRules map[string]any `json:"validation_rules,omitempty"`
+	DisplayOrder    int            `json:"display_order"`
+}
+
 type CustomerSalesOfferEvidence struct {
-	Reference            string
-	CatalogItemReference string
-	VariantReference     string
-	Name                 string
-	PricingMode          string
-	Amount               string
-	Currency             string
-	AvailabilityStatus   string `json:"availability_status"`
-	Status               string
-	EvidenceState        string
-	RetrievedAt          time.Time
-	SchemaVersion        int
+	Reference                   string
+	CatalogItemReference        string
+	VariantReference            string
+	Name                        string
+	PricingMode                 string
+	Amount                      string
+	Currency                    string
+	PricingUnit                 string     `json:"pricing_unit,omitempty"`
+	PriceSource                 string     `json:"price_source,omitempty"`
+	PriceVerificationStatus     string     `json:"price_verification_status,omitempty"`
+	PriceCheckedAt              *time.Time `json:"price_checked_at,omitempty"`
+	AvailabilityMode            string     `json:"availability_mode,omitempty"`
+	AvailabilityStatus          string `json:"availability_status"`
+	AvailabilitySource          string     `json:"availability_source,omitempty"`
+	AvailabilityCheckedAt       *time.Time `json:"availability_checked_at,omitempty"`
+	AvailabilityValidUntil      *time.Time `json:"availability_valid_until,omitempty"`
+	AvailabilityEvidenceRef     string     `json:"availability_evidence_ref,omitempty"`
+	FulfillmentMode             string     `json:"fulfillment_mode,omitempty"`
+	ValidityFrom                *time.Time `json:"validity_from,omitempty"`
+	ValidityUntil               *time.Time `json:"validity_until,omitempty"`
+	Status                      string
+	EvidenceState               string
+	RetrievedAt                 time.Time
+	SchemaVersion               int
 }
 
 type CustomerSalesKnowledgeEvidence struct {

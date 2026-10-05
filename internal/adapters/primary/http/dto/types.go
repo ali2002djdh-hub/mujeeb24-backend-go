@@ -284,13 +284,13 @@ type Variant struct {
 	ResourceVersion string         `json:"resource_version"`
 }
 type AttributeDefinition struct {
-	ID           UUID   `json:"id"`
-	Key          string `json:"key"`
-	Label        string `json:"label"`
-	DataType     string `json:"data_type"`
-	Required     bool   `json:"required"`
-	Searchable   bool   `json:"searchable"`
-	DisplayOrder int    `json:"display_order"`
+	ID              UUID           `json:"id"`
+	Key             string         `json:"key"`
+	Label           string         `json:"label"`
+	DataType        string         `json:"data_type"`
+	Required        bool           `json:"required"`
+	ValidationRules map[string]any `json:"validation_rules,omitempty"`
+	DisplayOrder    int            `json:"display_order"`
 }
 type AttributeSchema struct {
 	ID          UUID                  `json:"id"`

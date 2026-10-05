@@ -10,7 +10,7 @@
 // runs over the aggregated candidate set + customer message + context.
 //
 // Per contract ② §8, batches are NOT chained via previous_interaction_id;
-// each batch is an independent Interaction.
+// each batch is an independent stateless generateContent request.
 //
 // Per contract ④ §8, Structured Outputs enforces the JSON shape via
 // responseSchema; Mujeeb additionally validates the values per contract ⑥ §3.
@@ -156,10 +156,94 @@ func (c *BatchClient) buildBatchSystemInstructionWithSuffix(entityContract servi
 // defaultBatchSystemPrompt moved to internal/domain/ai/prompts/prompts.go
 // (Day 5 Gap #13 — versioned system prompts as reviewable assets).
 
+func (c *BatchClient) buildEvaluateBatchRequest(input services.BatchEvaluationInput, rc *resolvedAIConfig) (batchGeminiRequest, error) {
+	batchJSON, err := json.Marshal(input.Batch)
+	if err != nil {
+		return batchGeminiRequest{}, fmt.Errorf("marshal batch payload: %w", err)
+	}
+	contextJSON, err := json.Marshal(catalogBatchPromptContextFrom(&input.ConversationContext))
+	if err != nil {
+		return batchGeminiRequest{}, fmt.Errorf("marshal conversation context for batch: %w", err)
+	}
+	phaseLabel := "Catalog batch"
+	systemInstruction := c.buildBatchSystemInstruction(input.EntityContract)
+	if input.Reduction {
+		phaseLabel = "Candidate reduction batch"
+		systemInstruction = c.buildBatchSystemInstructionWithSuffix(input.EntityContract, prompts.CandidateReductionSystemPromptSuffix)
+	}
+	userPrompt := fmt.Sprintf("Customer message: %s\n\nVerified conversation context:\n%s\n\n%s %d data:\n%s",
+		input.CustomerMessage, string(contextJSON), phaseLabel, input.BatchNumber, string(batchJSON))
+	return batchGeminiRequest{
+		SystemInstruction: systemInstruction,
+		Contents: []batchContent{
+			{Role: "user", Parts: []batchPart{{Text: userPrompt}}},
+		},
+		GenerationConfig: batchGenerationConfig{
+			ResponseMimeType: "application/json",
+			ResponseSchema:   batchCandidateResponseSchema(),
+			MaxOutputTokens:  rc.maxOutputTokens,
+		},
+	}, nil
+}
+
+// CountBatchTokens counts the exact generateContent request that EvaluateBatch
+// will send. Google countTokens accepts generateContentRequest, so system
+// instructions, entity contract, batch JSON and response configuration stay
+// aligned with the real provider request.
+func (c *BatchClient) CountBatchTokens(ctx context.Context, input services.BatchEvaluationInput) (int, error) {
+	if c == nil {
+		return 0, errors.New("batch client is not configured")
+	}
+	rc, err := c.resolveConfig(ctx)
+	if err != nil {
+		return 0, err
+	}
+	reqBody, err := c.buildEvaluateBatchRequest(input, rc)
+	if err != nil {
+		return 0, err
+	}
+	wrapper := struct {
+		GenerateContentRequest batchGeminiRequest `json:"generateContentRequest"`
+	}{GenerateContentRequest: reqBody}
+	buf, err := json.Marshal(wrapper)
+	if err != nil {
+		return 0, fmt.Errorf("marshal exact countTokens request: %w", err)
+	}
+
+	url := fmt.Sprintf("%s/v1beta/models/%s:countTokens", rc.baseURL, rc.model)
+	reqCtx, cancel := context.WithTimeout(ctx, c.requestTimeout)
+	defer cancel()
+	httpReq, err := http.NewRequestWithContext(reqCtx, http.MethodPost, url, bytes.NewReader(buf))
+	if err != nil {
+		return 0, fmt.Errorf("build exact countTokens request: %w", err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("x-goog-api-key", rc.apiKey)
+	resp, err := c.httpClient.Do(httpReq)
+	if err != nil {
+		return 0, fmt.Errorf("send exact countTokens request: %w", err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<16))
+	if err != nil {
+		return 0, fmt.Errorf("read exact countTokens response: %w", err)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return 0, fmt.Errorf("exact countTokens status %d: %s", resp.StatusCode, string(body))
+	}
+	var out struct {
+		TotalTokens int `json:"totalTokens"`
+	}
+	if err := json.Unmarshal(body, &out); err != nil {
+		return 0, fmt.Errorf("unmarshal exact countTokens response: %w", err)
+	}
+	return out.TotalTokens, nil
+}
+
 // EvaluateBatch implements services.BatchGeminiClient.EvaluateBatch per
 // contract ② §5. Sends one batch to Gemini and returns the candidate set.
 //
-// Per contract ② §8, each batch is an independent Interaction — no
+// Per contract ② §8, each batch is an independent stateless generateContent request — no
 // previous_interaction_id chaining.
 //
 // Per contract ④ §8, Structured Outputs enforces the response shape via
@@ -179,22 +263,9 @@ func (c *BatchClient) EvaluateBatch(ctx context.Context, input services.BatchEva
 		return ports.CatalogBatchResult{}, err
 	}
 
-	batchJSON, err := json.Marshal(input.Batch)
+	reqBody, err := c.buildEvaluateBatchRequest(input, rc)
 	if err != nil {
-		return ports.CatalogBatchResult{}, fmt.Errorf("marshal batch payload: %w", err)
-	}
-	userPrompt := fmt.Sprintf("Customer message: %s\n\nCatalog batch %d data:\n%s",
-		input.CustomerMessage, input.BatchNumber, string(batchJSON))
-	reqBody := batchGeminiRequest{
-		Model:             rc.model,
-		SystemInstruction: c.buildBatchSystemInstruction(input.EntityContract),
-		Contents: []batchContent{
-			{Role: "user", Parts: []batchPart{{Text: userPrompt}}},
-		},
-		GenerationConfig: batchGenerationConfig{
-			ResponseMimeType: "application/json",
-			ResponseSchema:   batchCandidateResponseSchema(),
-		},
+		return ports.CatalogBatchResult{}, err
 	}
 	// Per P2-13: measure the wall-clock duration of the Gemini batch
 	// call so the usage record carries a real latency (instead of
@@ -244,6 +315,66 @@ func (c *BatchClient) EvaluateBatch(ctx context.Context, input services.BatchEva
 // The "الدليل التجاري المرتبط بالمرشحين" = full product details for each
 // candidate item. Without this, Gemini only sees IDs and can't compose
 // a response with product names, prices, descriptions.
+func (c *BatchClient) buildFinalEvaluateRequest(input services.FinalEvaluationInput, userPrompt string, rc *resolvedAIConfig) batchGeminiRequest {
+	return batchGeminiRequest{
+		SystemInstruction: c.buildBatchSystemInstructionWithSuffix(input.EntityContract, prompts.FinalEvaluationSystemPromptSuffix),
+		Contents: []batchContent{
+			{Role: "user", Parts: []batchPart{{Text: userPrompt}}},
+		},
+		GenerationConfig: batchGenerationConfig{
+			ResponseMimeType: "application/json",
+			ResponseSchema:   finalProposalResponseSchema(),
+			MaxOutputTokens:  rc.maxOutputTokens,
+		},
+	}
+}
+
+func (c *BatchClient) CountFinalTokens(ctx context.Context, input services.FinalEvaluationInput, userPrompt string) (int, error) {
+	if c == nil {
+		return 0, errors.New("batch client is not configured")
+	}
+	rc, err := c.resolveConfig(ctx)
+	if err != nil {
+		return 0, err
+	}
+	reqBody := c.buildFinalEvaluateRequest(input, userPrompt, rc)
+	wrapper := struct {
+		GenerateContentRequest batchGeminiRequest `json:"generateContentRequest"`
+	}{GenerateContentRequest: reqBody}
+	buf, err := json.Marshal(wrapper)
+	if err != nil {
+		return 0, fmt.Errorf("marshal final countTokens request: %w", err)
+	}
+	url := fmt.Sprintf("%s/v1beta/models/%s:countTokens", rc.baseURL, rc.model)
+	reqCtx, cancel := context.WithTimeout(ctx, c.requestTimeout)
+	defer cancel()
+	httpReq, err := http.NewRequestWithContext(reqCtx, http.MethodPost, url, bytes.NewReader(buf))
+	if err != nil {
+		return 0, fmt.Errorf("build final countTokens request: %w", err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("x-goog-api-key", rc.apiKey)
+	resp, err := c.httpClient.Do(httpReq)
+	if err != nil {
+		return 0, fmt.Errorf("send final countTokens request: %w", err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<16))
+	if err != nil {
+		return 0, fmt.Errorf("read final countTokens response: %w", err)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return 0, fmt.Errorf("final countTokens status %d: %s", resp.StatusCode, string(body))
+	}
+	var out struct {
+		TotalTokens int `json:"totalTokens"`
+	}
+	if err := json.Unmarshal(body, &out); err != nil {
+		return 0, fmt.Errorf("unmarshal final countTokens response: %w", err)
+	}
+	return out.TotalTokens, nil
+}
+
 func (c *BatchClient) FinalEvaluateWithDetails(ctx context.Context, input services.FinalEvaluationInput, userPrompt string) (ports.CustomerSalesProposal, ports.CustomerSalesUsageTelemetry, error) {
 	if c == nil {
 		return ports.CustomerSalesProposal{}, ports.CustomerSalesUsageTelemetry{}, errors.New("batch client is not configured")
@@ -252,20 +383,8 @@ func (c *BatchClient) FinalEvaluateWithDetails(ctx context.Context, input servic
 	if err != nil {
 		return ports.CustomerSalesProposal{}, ports.CustomerSalesUsageTelemetry{}, err
 	}
-	reqBody := batchGeminiRequest{
-		Model: rc.model,
-		SystemInstruction: c.buildBatchSystemInstructionWithSuffix(input.EntityContract,
-			"\n\nYou are now in FINAL EVALUATION mode. You have received the full product details for each candidate. Compose a complete Arabic response with product names, prices, descriptions, and availability. Do NOT invent item_ids that were not in the candidate set."),
-		Contents: []batchContent{
-			{Role: "user", Parts: []batchPart{{Text: userPrompt}}},
-		},
-		GenerationConfig: batchGenerationConfig{
-			ResponseMimeType: "application/json",
-			ResponseSchema:   finalProposalResponseSchema(),
-		},
-	}
-	// Per P2-13: measure the wall-clock duration of the final
-	// evaluation Gemini call so the usage record carries a real latency.
+	reqBody := c.buildFinalEvaluateRequest(input, userPrompt, rc)
+
 	finalStart := time.Now()
 	resp, err := c.sendRequestWithConfig(ctx, reqBody, rc)
 	finalEnd := time.Now()
@@ -395,8 +514,8 @@ func parseBatchCandidates(resp batchGeminiResponse) ([]ports.CatalogBatchCandida
 	var wrapper struct {
 		Candidates []ports.CatalogBatchCandidate `json:"candidates"`
 	}
-	if err := json.Unmarshal([]byte(raw), &wrapper); err != nil {
-		return nil, fmt.Errorf("unmarshal candidates wrapper: %w", err)
+	if err := decodeStrictStructuredJSON([]byte(raw), &wrapper); err != nil {
+		return nil, fmt.Errorf("decode candidates wrapper: %w", err)
 	}
 	return wrapper.Candidates, nil
 }
@@ -416,8 +535,8 @@ func parseFinalProposal(resp batchGeminiResponse) (ports.CustomerSalesProposal, 
 		return ports.CustomerSalesProposal{}, errors.New("empty structured output text per contract ④ §4")
 	}
 	var proposal ports.CustomerSalesProposal
-	if err := json.Unmarshal([]byte(raw), &proposal); err != nil {
-		return ports.CustomerSalesProposal{}, fmt.Errorf("unmarshal final proposal: %w", err)
+	if err := decodeStrictStructuredJSON([]byte(raw), &proposal); err != nil {
+		return ports.CustomerSalesProposal{}, fmt.Errorf("decode final proposal: %w", err)
 	}
 	return proposal, nil
 }
@@ -430,12 +549,14 @@ func parseFinalProposal(resp batchGeminiResponse) (ports.CustomerSalesProposal, 
 // offer_ids (array of string), reason (string).
 func batchCandidateResponseSchema() map[string]any {
 	return map[string]any{
-		"type": "object",
+		"type":                 "object",
+		"additionalProperties": false,
 		"properties": map[string]any{
 			"candidates": map[string]any{
 				"type": "array",
 				"items": map[string]any{
-					"type": "object",
+					"type":                 "object",
+					"additionalProperties": false,
 					"properties": map[string]any{
 						"item_id":     map[string]any{"type": "string"},
 						"variant_ids": map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
@@ -453,49 +574,11 @@ func batchCandidateResponseSchema() map[string]any {
 // finalProposalResponseSchema is the JSON Schema that enforces the contract
 // ④ §4 final proposal output shape (same as the regular proposal schema).
 func finalProposalResponseSchema() map[string]any {
-	return map[string]any{
-		"type": "object",
-		"properties": map[string]any{
-			"status": map[string]any{
-				"type": "string",
-				"enum": []string{
-					string(ports.CustomerSalesProposalStatusResolved),
-					string(ports.CustomerSalesProposalStatusAmbiguous),
-					string(ports.CustomerSalesProposalStatusNotFound),
-					string(ports.CustomerSalesProposalStatusNeedsMoreData),
-				},
-			},
-			"action": map[string]any{
-				"type": "string",
-				"enum": []string{
-					string(ports.CustomerSalesProposalActionAnswer),
-					string(ports.CustomerSalesProposalActionClarification),
-					string(ports.CustomerSalesProposalActionHumanRequest),
-					string(ports.CustomerSalesProposalActionLeadDraft),
-					string(ports.CustomerSalesProposalActionOrderDraft),
-				},
-			},
-			"response_text": map[string]any{"type": "string"},
-			"selected": map[string]any{
-				"type": "array",
-				"items": map[string]any{
-					"type": "object",
-					"properties": map[string]any{
-						"item_id":    map[string]any{"type": "string"},
-						"variant_id": map[string]any{"type": "string"},
-						"offer_id":   map[string]any{"type": "string"},
-					},
-					"required": []string{"item_id"},
-				},
-			},
-		},
-		"required": []string{"status", "action", "response_text"},
-	}
+	return contractProposalResponseSchema()
 }
 
 // batchGeminiRequest is the generateContent request body.
 type batchGeminiRequest struct {
-	Model             string                `json:"model"`
 	SystemInstruction *batchContent         `json:"systemInstruction,omitempty"`
 	Contents          []batchContent        `json:"contents"`
 	GenerationConfig  batchGenerationConfig `json:"generationConfig"`
@@ -504,6 +587,7 @@ type batchGeminiRequest struct {
 type batchGenerationConfig struct {
 	ResponseMimeType string         `json:"responseMimeType,omitempty"`
 	ResponseSchema   map[string]any `json:"responseSchema,omitempty"`
+	MaxOutputTokens  int            `json:"maxOutputTokens,omitempty"`
 }
 
 type batchContent struct {

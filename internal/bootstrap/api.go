@@ -171,21 +171,10 @@ func newAPIWithExternalAndAuthentication(database *postgres.Adapter, address str
 		platformOperations.RegisterProbe("socialapi", external.SocialAPIHealthProbe)
 	}
 
-	// Customer-sales capabilities are owned by the application layer.
-	// The Gemini adapter receives only the narrow CustomerSalesToolPort.
-	catalogRepository := postgres.NewCatalogRepository(database)
-	capabilityRegistry := services.NewCustomerSalesToolRegistry()
-	catalogCapability := services.NewCustomerSalesCatalogDataTool(
-		services.ListCatalogsQueryService{Repository: catalogRepository},
-		services.ListCatalogItemsQueryService{Repository: catalogRepository},
-		services.GetCatalogItemQueryService{Repository: catalogRepository},
-		services.ListOffersQueryService{Repository: catalogRepository},
-		services.ListVariantsQueryService{Repository: catalogRepository},
-		services.GetAttributeSchemaQueryService{Repository: catalogRepository},
-	)
-	if err := capabilityRegistry.Register(catalogCapability); err != nil {
-		return nil, fmt.Errorf("register customer sales catalog capability: %w", err)
-	}
+	// Customer Sales deliberately has no catalog tool registry. The catalog has
+	// one authoritative AI path: bounded manifest on the initial turn, then
+	// complete catalog paging/batching when Gemini returns needs_more_data.
+	// This prevents competing catalog-read paths and keeps evidence deterministic.
 	// Per §1-2: create the AIConfigurationCache + AIProviderConfigRepository
 	// unconditionally — the Platform Admin can manage credentials and models
 	// even when AutoReply is disabled. The cache seeds from env on first
@@ -225,13 +214,13 @@ func newAPIWithExternalAndAuthentication(database *postgres.Adapter, address str
 		func() string {
 			m := strings.TrimSpace(os.Getenv("GEMINI_MODEL"))
 			if m == "" {
-				m = "gemini-3.5-flash-lite"
+				m = "gemini-3.8-flash"
 			}
 			return m
 		}(),
 		"https://generativelanguage.googleapis.com",
-		700,   // LLMMaxOutputTokens default
-		12000, // LLMMaxInputCharacters default
+		4096,  // LLMMaxOutputTokens default
+		48000, // LLMMaxInputCharacters default; bounded app guard below Gemini 3.8 context capacity
 		"",
 	)
 
@@ -246,7 +235,7 @@ func newAPIWithExternalAndAuthentication(database *postgres.Adapter, address str
 		var runRepo ports.AIRunRepository
 		if external.GeminiHTTPClient != nil {
 			geminiClient = external.GeminiHTTPClient
-			customerSalesAdapter, err := gemini.NewGeminiCustomerSalesAdapter(geminiClient, capabilityRegistry)
+			customerSalesAdapter, err := gemini.NewGeminiCustomerSalesAdapter(geminiClient, nil)
 			if err != nil {
 				return nil, fmt.Errorf("build customer sales AI adapter: %w", err)
 			}
@@ -298,9 +287,11 @@ func newAPIWithExternalAndAuthentication(database *postgres.Adapter, address str
 		// Per contract ⑤ §7, build the Catalog Entity Contract payload
 		// once and reuse for every call.
 		entityContract := services.BuildCatalogEntityContractPayload()
-		if payloadBytes, err := json.Marshal(entityContract); err == nil {
-			service.EntityContractPayload = payloadBytes
+		payloadBytes, err := json.Marshal(entityContract)
+		if err != nil {
+			return nil, fmt.Errorf("marshal catalog entity contract: %w", err)
 		}
+		service.EntityContractPayload = payloadBytes
 		contextBuilder := services.NewAutoReplyContextBuilder(
 			postgres.NewBusinessRepository(database),
 			postgres.NewConversationRepository(database),
@@ -308,6 +299,9 @@ func newAPIWithExternalAndAuthentication(database *postgres.Adapter, address str
 			postgres.NewCatalogRepository(database),
 			postgres.NewMessageRepository(database),
 		)
+		// Universal Catalog AI v3: shared read-only catalog boundary.
+		// It supplies the bounded manifest and complete bulk projection pages.
+		contextBuilder.CatalogAI = postgres.NewCatalogAIReadRepository(database)
 		contextBuilder.Knowledge = postgres.NewKnowledgeDocumentRepository(database)
 		contextBuilder.Policies = postgres.NewBusinessPolicyRepository(database)
 		service.CustomerSalesContextBuilder = contextBuilder
@@ -365,26 +359,33 @@ func newAPIWithExternalAndAuthentication(database *postgres.Adapter, address str
 		service.Realtime = realtimeBroker
 
 		// Per contract ② §9, wire the CatalogBatchController into the
-		// AutoReply flow. When Gemini's first response indicates
-		// needs_more_data AND the context lacks catalog evidence, the
-		// controller is invoked: build projection → token-count → batch
-		// → evaluate → aggregate candidates → final evaluate.
+		// AutoReply flow. Full catalog evaluation is invoked when the
+		// initial proposal needs more data, returns not_found before
+		// complete coverage, or selects references outside current evidence:
+		// page catalog → exact-token batches → evaluate → aggregate → final.
 		//
 		// Per contract ② §2, TokenBudget is token-based (no hardcoded
 		// item count). 8000 is a sensible default per runtime config.
 		if geminiClient := external.GeminiHTTPClient; geminiClient != nil {
-			batchTokenCounter, _ := gemini.NewTokenCounter(gemini.TokenCounterConfig{
+			batchTokenCounter, err := gemini.NewTokenCounter(gemini.TokenCounterConfig{
 				BaseURL: geminiClient.BaseURL(),
 				APIKey:  geminiClient.APIKey(),
 				Model:   geminiClient.Model(),
 			})
-			batchClient, _ := gemini.NewBatchClient(gemini.BatchClientConfig{
+			if err != nil {
+				return nil, fmt.Errorf("build Gemini token counter: %w", err)
+			}
+			batchClient, err := gemini.NewBatchClient(gemini.BatchClientConfig{
 				BaseURL: geminiClient.BaseURL(),
 				APIKey:  geminiClient.APIKey(),
 				Model:   geminiClient.Model(),
 			})
+			if err != nil {
+				return nil, fmt.Errorf("build Gemini catalog batch client: %w", err)
+			}
 			service.CatalogBatch = &services.CatalogBatchController{
 				Catalogs:          postgres.NewCatalogRepository(database),
+				CatalogAI:         postgres.NewCatalogAIReadRepository(database),
 				ProjectionBuilder: &services.CatalogAIProjectionBuilder{},
 				TokenCounter:      batchTokenCounter,
 				Gemini:            batchClient,

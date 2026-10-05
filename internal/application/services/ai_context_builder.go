@@ -2,10 +2,8 @@ package services
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 
@@ -29,6 +27,7 @@ type AutoReplyContextBuilder struct {
 	Conversations ports.ConversationRepository
 	Customers     ports.CustomerRepository
 	Catalogs      ports.CatalogRepository
+	CatalogAI     ports.CatalogAIReadRepository
 	Messages      ports.MessageRepository
 	Knowledge     ports.KnowledgeDocumentRepository
 	Policies      ports.BusinessPolicyRepository
@@ -154,6 +153,16 @@ func (b AutoReplyContextBuilder) Build(ctx context.Context, input ports.Customer
 	}
 	context.RecentMessages = buildRecentMessageEvidence(messagePage.Items, input.SourceMessageReference, now)
 
+	// Universal Catalog AI v3: every turn gets a bounded map of the whole
+	// active catalog. This is discovery metadata, not executable evidence.
+	if b.CatalogAI != nil {
+		manifest, manifestErr := b.CatalogAI.GetManifest(ctx, input.BusinessID)
+		if manifestErr != nil {
+			return ports.CustomerSalesContext{}, manifestErr
+		}
+		context.CatalogManifest = &manifest
+	}
+
 	mode, focus, comparison := resolveRetrievalMode(input.ConversationState)
 	switch mode {
 	case retrievalScopedOffer, retrievalScopedItem, retrievalScopedCatalog, retrievalScopedVariant:
@@ -167,15 +176,6 @@ func (b AutoReplyContextBuilder) Build(ctx context.Context, input ports.Customer
 			context.CatalogEvidence = scopedItems
 			context.OfferEvidence = scopedOffers
 			context.VariantEvidence = scopedVariants
-			// Candidates let AI resolve a switch to a new entity. Focused
-			// evidence stays first; validation still rejects mixing.
-			if addItems, addOffers, addVariants, err := b.augmentScopedWithCandidates(ctx, input.BusinessID, input.Text, scopedItems, now); err != nil {
-				return ports.CustomerSalesContext{}, err
-			} else {
-				context.CatalogEvidence = append(context.CatalogEvidence, addItems...)
-				context.OfferEvidence = append(context.OfferEvidence, addOffers...)
-				context.VariantEvidence = append(context.VariantEvidence, addVariants...)
-			}
 			return b.finalizeContext(ctx, context, input, now)
 		}
 	case retrievalScopedComparison:
@@ -188,100 +188,12 @@ func (b AutoReplyContextBuilder) Build(ctx context.Context, input ports.Customer
 			context.CatalogEvidence = scopedItems
 			context.OfferEvidence = scopedOffers
 			context.VariantEvidence = scopedVariants
-			// Same candidate augmentation as scoped mode, so the AI can leave
-			// the comparison cleanly when the customer asks something new.
-			if addItems, addOffers, addVariants, err := b.augmentScopedWithCandidates(ctx, input.BusinessID, input.Text, scopedItems, now); err != nil {
-				return ports.CustomerSalesContext{}, err
-			} else {
-				context.CatalogEvidence = append(context.CatalogEvidence, addItems...)
-				context.OfferEvidence = append(context.OfferEvidence, addOffers...)
-				context.VariantEvidence = append(context.VariantEvidence, addVariants...)
-			}
 			return b.finalizeContext(ctx, context, input, now)
 		}
 	}
-	// Broader retrieval: active catalogs, active items, lexical rank.
-	catalogPage, err := b.Catalogs.ListCatalogs(ctx, input.BusinessID, "active", b.maxCatalogs(), "")
-	if err != nil {
-		return ports.CustomerSalesContext{}, err
-	}
-	for _, catalog := range catalogPage.Items {
-		if catalog.BusinessID != input.BusinessID {
-			return ports.CustomerSalesContext{}, errors.New("AI context catalog scope mismatch")
-		}
-		items, listErr := b.Catalogs.ListCatalogItems(ctx, input.BusinessID, catalog.ID, "", "active", b.maxItems()*3, "")
-		if listErr != nil {
-			return ports.CustomerSalesContext{}, listErr
-		}
-		for _, item := range rankCatalogItems(items.Items, input.Text) {
-			if item.BusinessID != input.BusinessID || item.CatalogID != catalog.ID {
-				return ports.CustomerSalesContext{}, errors.New("AI context catalog item scope mismatch")
-			}
-			context.CatalogEvidence = append(context.CatalogEvidence, ports.CustomerSalesCatalogEvidence{
-				Reference:            item.ID,
-				CatalogReference:     item.CatalogID,
-				ItemType:             item.ItemType,
-				Name:                 item.Name,
-				Status:               item.Status,
-				Attributes:           safeJSONObject(item.Attributes),
-				EvidenceState:        CustomerSalesContextFresh,
-				RetrievedAt:          now,
-				SchemaVersion:        AIEvidenceSchemaVersion,
-				ShortDescription:     item.ShortDescription,
-				LongDescription:      item.LongDescription,
-				PricingMode:          item.PricingMode,
-				AvailabilityMode:     item.AvailabilityMode,
-				FulfillmentMode:      item.FulfillmentMode,
-				RequiresConfirmation: item.RequiresConfirmation,
-			})
-			if len(context.CatalogEvidence) >= b.maxItems() {
-				break
-			}
-		}
-		if len(context.CatalogEvidence) >= b.maxItems() {
-			break
-		}
-	}
-
-	// Build the catalog summary: fetch ALL active item names (lightweight)
-	// so Gemini knows the full catalog exists even though only MaxItems
-	// have detailed evidence. This prevents Gemini from saying "we don't
-	// have this product" for products that exist but weren't in the 5-item
-	// detailed sample.
-	for _, catalog := range catalogPage.Items {
-		summaryCursor := ""
-		for {
-			summaryItems, summaryErr := b.Catalogs.ListCatalogItems(ctx, input.BusinessID, catalog.ID, "", "active", 500, summaryCursor)
-			if summaryErr != nil {
-				break
-			}
-			for _, item := range summaryItems.Items {
-				entry := ports.CustomerSalesCatalogSummaryEntry{
-					ID:          item.ID,
-					Name:        item.Name,
-					CatalogName: catalog.Name,
-				}
-				offers, offerErr := b.Catalogs.ListOffers(ctx, input.BusinessID, item.ID, "active", 1, "")
-				if offerErr == nil && len(offers.Items) > 0 {
-					entry.Price = formatPrice(stringValue(offers.Items[0].Amount))
-					entry.Currency = formatCurrency(stringValue(offers.Items[0].Currency))
-					entry.AvailabilityStatus = offers.Items[0].AvailabilityStatus
-				}
-				context.CatalogSummary = append(context.CatalogSummary, entry)
-			}
-			if !summaryItems.HasMore {
-				break
-			}
-			summaryCursor = summaryItems.NextCursor
-		}
-	}
-
-	// Per ADR-048: populate CatalogNames (category names only) for
-	// hierarchical navigation. Gemini uses this to respond to "what do
-	// you have?" with a category listing instead of dumping all items.
-	for _, catalog := range catalogPage.Items {
-		context.CatalogNames = append(context.CatalogNames, catalog.Name)
-	}
+	// Without a validated conversation focus, only the bounded catalog manifest
+	// is attached here. Item-level catalog data is handled by the complete
+	// catalog evaluation path when the model requests additional data.
 
 	if b.Knowledge != nil {
 		knowledgeRecords, listErr := b.Knowledge.ListPublished(ctx, input.BusinessID, "", now, b.maxKnowledge()*3)
@@ -337,25 +249,7 @@ func (b AutoReplyContextBuilder) Build(ctx context.Context, input ports.Customer
 			if offer.BusinessID != input.BusinessID || offer.CatalogItemID != item.Reference {
 				return ports.CustomerSalesContext{}, errors.New("AI context offer scope mismatch")
 			}
-			evidenceState := CustomerSalesContextFresh
-			if strings.EqualFold(strings.TrimSpace(offer.AvailabilityStatus), "unknown") || strings.EqualFold(strings.TrimSpace(offer.AvailabilityStatus), "stale") {
-				evidenceState = CustomerSalesContextStale
-			}
-			context.OfferEvidence = append(context.OfferEvidence, ports.CustomerSalesOfferEvidence{
-				Reference:            offer.ID,
-				CatalogItemReference: offer.CatalogItemID,
-				VariantReference:     stringValue(offer.VariantID),
-				Name:                 offer.Name,
-				PricingMode:          offer.PricingMode,
-				Amount:               stringValue(offer.Amount),
-				Currency:             stringValue(offer.Currency),
-				AvailabilityStatus:   offer.AvailabilityStatus,
-				Status:               offer.Status,
-				EvidenceState:        evidenceState,
-				RetrievedAt:          now,
-
-				SchemaVersion: AIEvidenceSchemaVersion,
-			})
+			context.OfferEvidence = append(context.OfferEvidence, toOfferEvidence(offer, now))
 		}
 		variants, listErr := b.Catalogs.ListVariants(ctx, input.BusinessID, item.Reference, "active", b.maxVariants(), "")
 		if listErr != nil {
@@ -441,106 +335,6 @@ func buildRecentMessageEvidence(records []ports.CommunicationMessageRecord, sour
 		return items[i].Reference < items[j].Reference
 	})
 	return items
-}
-
-func rankCatalogItems(items []ports.CatalogItemRecord, text string) []ports.CatalogItemRecord {
-	queryTokens := tokenize(text)
-	type scored struct {
-		item  ports.CatalogItemRecord
-		score int
-	}
-	scoredItems := make([]scored, 0, len(items))
-	for _, item := range items {
-		searchable := normalizeArabic(strings.ToLower(item.Name + " " + item.ItemType + " " + string(item.Attributes)))
-		score := 0
-		for _, token := range queryTokens {
-			if strings.Contains(searchable, token) {
-				score++
-			}
-		}
-		scoredItems = append(scoredItems, scored{item: item, score: score})
-	}
-	sort.SliceStable(scoredItems, func(i, j int) bool {
-		if scoredItems[i].score != scoredItems[j].score {
-			return scoredItems[i].score > scoredItems[j].score
-		}
-		return scoredItems[i].item.ID < scoredItems[j].item.ID
-	})
-	result := make([]ports.CatalogItemRecord, 0, len(scoredItems))
-	for _, value := range scoredItems {
-		result = append(result, value.item)
-	}
-	return result
-}
-
-func normalizeArabic(s string) string {
-	var b strings.Builder
-	for _, r := range s {
-		switch r {
-		case 'أ', 'إ', 'آ', 'ٱ':
-			b.WriteRune('ا')
-		case 'ة':
-			b.WriteRune('ه')
-		case 'ى':
-			b.WriteRune('ي')
-		case 'ؤ':
-			b.WriteRune('و')
-		case 'ئ':
-			b.WriteRune('ي')
-		default:
-			b.WriteRune(r)
-		}
-	}
-	return b.String()
-}
-
-func tokenize(text string) []string {
-	normalized := normalizeArabic(strings.ToLower(text))
-	fields := strings.Fields(normalized)
-	result := make([]string, 0, len(fields))
-	for _, field := range fields {
-		field = strings.Trim(field, ".,!?؟:;()[]{}\"'")
-		if len([]rune(field)) >= 2 {
-			result = append(result, field)
-		}
-	}
-	return result
-}
-
-func safeJSONObject(value []byte) []byte {
-	if len(value) == 0 {
-		return []byte(`{}`)
-	}
-	var object map[string]json.RawMessage
-	if json.Unmarshal(value, &object) != nil {
-		return []byte(`{}`)
-	}
-	encoded, err := json.Marshal(object)
-	if err != nil {
-		return []byte(`{}`)
-	}
-	return encoded
-}
-
-func safeJSONDocument(value []byte) []byte {
-	if len(value) == 0 || !json.Valid(value) {
-		return []byte(`{}`)
-	}
-	return append([]byte(nil), value...)
-}
-
-func evidenceStateForValidity(now, validFrom time.Time, validUntil *time.Time) string {
-	if now.Before(validFrom) {
-		return CustomerSalesContextMissing
-	}
-	if validUntil != nil && !now.Before(*validUntil) {
-		return CustomerSalesContextStale
-	}
-	return CustomerSalesContextFresh
-}
-
-func formatInt(value int) string {
-	return strconv.Itoa(value)
 }
 
 func rankKnowledgeRecords(records []ports.KnowledgeDocumentRecord, text string) []ports.KnowledgeDocumentRecord {

@@ -35,13 +35,12 @@ func TestGeminiLiveSmoke(t *testing.T) {
 		BaseURL:        "https://generativelanguage.googleapis.com",
 		APIKey:         apiKey,
 		Model:          "gemini-3.5-flash",
-		SystemPrompt:   "You are a test assistant. Reply with a simple answer.",
 		RequestTimeout: 30 * time.Second,
 	})
 	if err != nil {
 		t.Fatalf("build client: %v", err)
 	}
-	cc, err := NewGeminiCustomerSalesAdapter(client)
+	cc, err := NewGeminiCustomerSalesAdapter(client, nil)
 	if err != nil {
 		t.Fatalf("build contract client: %v", err)
 	}

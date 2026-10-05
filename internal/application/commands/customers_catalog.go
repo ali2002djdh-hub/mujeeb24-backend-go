@@ -49,12 +49,12 @@ type CreateAttributeSchemaVersionCommand struct {
 	Definitions []AttributeDefinition
 }
 type AttributeDefinition struct {
-	Key          string
-	Label        string
-	DataType     string
-	Required     bool
-	Searchable   bool
-	DisplayOrder int
+	Key             string
+	Label           string
+	DataType        string
+	Required        bool
+	ValidationRules map[string]any
+	DisplayOrder    int
 }
 type CreateCatalogItemCommand struct {
 	Meta                 CommandMeta

@@ -91,7 +91,6 @@ type AttributeDefinitionRecord struct {
 	Label           string
 	DataType        string
 	Required        bool
-	Searchable      bool
 	ValidationRules []byte
 	DisplayOrder    int
 }
@@ -170,7 +169,6 @@ type AttributeDefinitionDraft struct {
 	Label           string
 	DataType        string
 	Required        bool
-	Searchable      bool
 	ValidationRules []byte
 	DisplayOrder    int
 	CreatedAt       time.Time

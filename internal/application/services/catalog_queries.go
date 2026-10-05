@@ -162,7 +162,12 @@ func variantView(record ports.VariantRecord) commands.VariantView {
 func attributeSchemaView(record ports.AttributeSchemaRecord) commands.AttributeSchemaView {
 	definitions := make([]commands.AttributeDefinitionView, 0, len(record.Definitions))
 	for _, definition := range record.Definitions {
-		definitions = append(definitions, commands.AttributeDefinitionView{ID: commands.ID(definition.ID), Key: definition.Key, Label: definition.Label, DataType: definition.DataType, Required: definition.Required, Searchable: definition.Searchable, DisplayOrder: definition.DisplayOrder})
+		definitions = append(definitions, commands.AttributeDefinitionView{
+			ID: commands.ID(definition.ID), Key: definition.Key, Label: definition.Label,
+			DataType: definition.DataType, Required: definition.Required,
+			ValidationRules: parseJSONAttributes(definition.ValidationRules),
+			DisplayOrder: definition.DisplayOrder,
+		})
 	}
 	return commands.AttributeSchemaView{ID: commands.AttributeSchemaID(record.ID), BusinessID: commands.BusinessID(record.BusinessID), Name: record.Name, Version: record.Version, Definitions: definitions}
 }

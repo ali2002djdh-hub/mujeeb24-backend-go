@@ -38,6 +38,7 @@ func TestAutoReplyUsesContractRuntimeProposalBeforeEnqueue(t *testing.T) {
 	service.Subscriptions = &stubSubscriptionsRepo{items: []ports.SubscriptionRecord{{ID: "sub-1", BusinessID: "business-1", Status: "ACTIVE"}}}
 	service.AIPricing = &stubPricingRepoAlwaysFail{}
 	service.NewID = func() string { return "test-id" }
+	service.Validation = allowAllValidationPipeline()
 
 	result, err := service.Handle(context.Background(), commands.AutoReplyCommand{Meta: commands.CommandMeta{Actor: commands.ActorContext{BusinessID: "business-1"}}, ConversationID: "conversation-1", SourceMessageReference: "inbound-llm-1", Text: "مرحبا", Channel: "whatsapp", ProviderRef: "socialapi"})
 	if err != nil {

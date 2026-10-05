@@ -49,7 +49,7 @@ func TestCatalogAttributeSchemaTenantDefenseAgainstPostgres(t *testing.T) {
 	if _, err := adapter.Pool().Exec(ctx, `INSERT INTO attribute_schemas (id, business_id, name, version, created_at, updated_at) VALUES ($1::uuid, $2::uuid, 'Schema A', 1, now(), now()), ($3::uuid, $4::uuid, 'Schema B', 1, now(), now())`, schemaA, businessA, schemaB, businessB); err != nil {
 		t.Fatalf("insert schemas: %v", err)
 	}
-	if _, err := adapter.Pool().Exec(ctx, `INSERT INTO attribute_definitions (id, schema_id, attribute_key, label, data_type, is_required, is_searchable, validation_rules, display_order, created_at, updated_at) VALUES ($1::uuid, $2::uuid, 'color', 'Color', 'text', true, true, '{}'::jsonb, 0, now(), now()), ($3::uuid, $4::uuid, 'size', 'Size', 'text', false, true, '{}'::jsonb, 0, now(), now())`, defA, schemaA, defB, schemaB); err != nil {
+	if _, err := adapter.Pool().Exec(ctx, `INSERT INTO attribute_definitions (id, schema_id, attribute_key, label, data_type, is_required, validation_rules, display_order, created_at, updated_at) VALUES ($1::uuid, $2::uuid, 'color', 'Color', 'text', true, '{}'::jsonb, 0, now(), now()), ($3::uuid, $4::uuid, 'size', 'Size', 'text', false, '{}'::jsonb, 0, now(), now())`, defA, schemaA, defB, schemaB); err != nil {
 		t.Fatalf("insert definitions: %v", err)
 	}
 

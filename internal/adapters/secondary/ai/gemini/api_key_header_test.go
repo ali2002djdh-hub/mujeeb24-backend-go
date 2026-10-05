@@ -46,6 +46,9 @@ func (h *capturingHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Return a minimal valid response. The exact shape doesn't matter —
 	// the test only verifies the request side (URL + headers).
 	switch {
+	case r.URL.Path == "/v1beta/interactions":
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"id":"int-test","status":"completed","steps":[{"type":"model_output","content":[{"type":"text","text":"{\"status\":\"resolved\",\"action\":\"answer\",\"response_text\":\"ok\",\"selected\":[]}" }]}],"usage":{"total_input_tokens":5,"total_output_tokens":3,"total_cached_tokens":0}}`))
 	case strings.Contains(r.URL.Path, ":generateContent"):
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{"candidates":[{"content":{"parts":[{"text":"ok"}]}}],"usageMetadata":{"promptTokenCount":5,"candidatesTokenCount":3,"cachedContentTokenCount":0}}`))

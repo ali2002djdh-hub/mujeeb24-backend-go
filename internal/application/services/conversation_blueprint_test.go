@@ -147,7 +147,7 @@ func TestRetrieveComparisonItemBranchIncludesOffers(t *testing.T) {
 }
 
 // Comparison mode must still admit new candidates so the AI can leave it.
-func TestRetrieveComparisonAugmentsCandidates(t *testing.T) {
+func TestRetrieveComparisonDoesNotBackendMatchSiblingCandidates(t *testing.T) {
 	builder := comparisonTestBuilder(newComparisonStubRepo())
 	ctx, err := builder.Build(context.Background(), ports.CustomerSalesContextInput{
 		BusinessID: "b1", ConversationID: "c1", Text: "what about extra?",
@@ -159,17 +159,13 @@ func TestRetrieveComparisonAugmentsCandidates(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
-	found := false
 	for _, item := range ctx.CatalogEvidence {
 		if item.Reference == "item-c" {
-			found = true
+			t.Fatalf("backend must not add sibling candidates from message matching: %#v", ctx.CatalogEvidence)
 		}
 	}
-	if !found {
-		t.Fatalf("expected sibling candidate item-c in evidence: %#v", ctx.CatalogEvidence)
-	}
-	if len(ctx.CatalogEvidence) > 5 {
-		t.Fatalf("evidence exceeds budget: %d", len(ctx.CatalogEvidence))
+	if len(ctx.CatalogEvidence) != 2 {
+		t.Fatalf("comparison context must stay on validated IDs only, got %d items: %#v", len(ctx.CatalogEvidence), ctx.CatalogEvidence)
 	}
 }
 
@@ -251,6 +247,7 @@ func TestAutoReplyHandoffFarewellOnSubscription(t *testing.T) {
 	service.Subscriptions = &stubSubscriptionsRepo{items: []ports.SubscriptionRecord{{ID: "sub-1", BusinessID: "business-1", Status: "ACTIVE"}}}
 	service.AIPricing = &stubPricingRepoAlwaysFail{}
 	service.NewID = func() string { return "test-id" }
+	service.Validation = allowAllValidationPipeline()
 	result, err := service.Handle(context.Background(), commands.AutoReplyCommand{Meta: commands.CommandMeta{Actor: commands.ActorContext{BusinessID: "business-1"}}, ConversationID: "conversation-1", SourceMessageReference: "inbound-1", Text: "أريد الاشتراك", Channel: "whatsapp", ProviderRef: "socialapi"})
 	if err != nil {
 		t.Fatalf("Handle: %v", err)
@@ -294,6 +291,7 @@ func TestAutoReplyHandoffFarewellBlockedWhenApprovalRequired(t *testing.T) {
 		outbox,
 		fakeTransactionManager{},
 	)
+	service.Validation = allowAllValidationPipeline()
 	result, err := service.Handle(context.Background(), commands.AutoReplyCommand{Meta: commands.CommandMeta{Actor: commands.ActorContext{BusinessID: "business-1"}}, ConversationID: "conversation-1", SourceMessageReference: "inbound-1", Text: "أريد الاشتراك", Channel: "whatsapp", ProviderRef: "socialapi"})
 	if err != nil {
 		t.Fatalf("Handle: %v", err)

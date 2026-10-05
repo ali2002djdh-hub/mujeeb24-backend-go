@@ -117,7 +117,15 @@ func (s CreateAttributeSchemaVersionCommandService) Handle(ctx context.Context, 
 		if definition.Key == "" || definition.Label == "" || definition.DataType == "" || definition.DisplayOrder < 0 {
 			return result, appErrors.New(appErrors.CodeValidation, "attribute definition is invalid at index "+strconv.Itoa(index))
 		}
-		definitionDrafts = append(definitionDrafts, ports.AttributeDefinitionDraft{ID: s.id(), Key: definition.Key, Label: definition.Label, DataType: definition.DataType, Required: definition.Required, Searchable: definition.Searchable, DisplayOrder: definition.DisplayOrder, ValidationRules: []byte(`{}`), CreatedAt: s.now(), UpdatedAt: s.now()})
+		rules, rulesErr := encodeObject(definition.ValidationRules)
+		if rulesErr != nil {
+			return result, appErrors.New(appErrors.CodeValidation, "attribute validation_rules are invalid at index "+strconv.Itoa(index))
+		}
+		definitionDrafts = append(definitionDrafts, ports.AttributeDefinitionDraft{
+			ID: s.id(), Key: definition.Key, Label: definition.Label, DataType: definition.DataType,
+			Required: definition.Required, DisplayOrder: definition.DisplayOrder,
+			ValidationRules: rules, CreatedAt: s.now(), UpdatedAt: s.now(),
+		})
 	}
 	now := s.now()
 	var record ports.AttributeSchemaRecord
@@ -414,20 +422,11 @@ func (s AuthorCatalogItemCommandService) Handle(ctx context.Context, command com
 	}
 
 	itemType := strings.TrimSpace(command.ItemType)
-	if itemType == "" {
-		itemType = "product"
-	}
 	pricingMode := strings.TrimSpace(command.PricingMode)
-	if pricingMode == "" {
-		pricingMode = "fixed"
-	}
 	availabilityMode := strings.TrimSpace(command.AvailabilityMode)
-	if availabilityMode == "" {
-		availabilityMode = "stock"
-	}
 	fulfillmentMode := strings.TrimSpace(command.FulfillmentMode)
-	if fulfillmentMode == "" {
-		fulfillmentMode = "standard"
+	if itemType == "" || pricingMode == "" || availabilityMode == "" || fulfillmentMode == "" {
+		return result, appErrors.New(appErrors.CodeValidation, "item_type, pricing_mode, availability_mode, and fulfillment_mode are required; no catalog defaults are inferred")
 	}
 
 	attributes, err := encodeObject(command.Attributes)

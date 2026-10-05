@@ -14,6 +14,8 @@
 
 package services
 
+import "sort"
+
 // CatalogEntityContract is the canonical definition of the six catalog entities
 // per contract ⑤ §2. It is sent to Gemini as part of the system context.
 //
@@ -35,6 +37,7 @@ type CatalogEntityDefinition struct {
 	ID          string `json:"id"`
 	Name        string `json:"name"`
 	Description string `json:"description"`
+	Status      string `json:"status"`
 }
 
 // CatalogItemEntityDefinition is the CatalogItem entity per contract ⑤ §2.
@@ -92,7 +95,6 @@ type AttributeDefinitionEntityDefinition struct {
 	Label           string         `json:"label"`
 	DataType        string         `json:"data_type"`
 	IsRequired      bool           `json:"is_required"`
-	IsSearchable    bool           `json:"is_searchable"`
 	ValidationRules map[string]any `json:"validation_rules,omitempty"`
 	DisplayOrder    int            `json:"display_order"`
 }
@@ -132,6 +134,7 @@ type VariantEntityDefinition struct {
 //     as confirmed availability.
 type OfferEntityDefinition struct {
 	ID                      string  `json:"id"`
+	CatalogItemID           string  `json:"catalog_item_id"`
 	VariantID               *string `json:"variant_id,omitempty"`
 	Name                    string  `json:"name"`
 	PricingMode             string  `json:"pricing_mode"`
@@ -168,7 +171,10 @@ type CatalogEntityContractDescriptor struct {
 	FulfillmentModes          map[string]string `json:"fulfillment_modes"`
 	// ItemStatuses is the CatalogItem status set from migration 000016.
 	// CatalogItem does NOT allow expired; expired belongs to Offer status in migration 000018.
-	ItemStatuses map[string]string `json:"item_statuses"`
+	CatalogStatuses map[string]string `json:"catalog_statuses"`
+	ItemStatuses    map[string]string `json:"item_statuses"`
+	VariantStatuses map[string]string `json:"variant_statuses"`
+	OfferStatuses   map[string]string `json:"offer_statuses"`
 	// NOTE: ItemTypes is intentionally ABSENT. Per SQL migration 000016,
 	// item_type is TEXT (non-empty), NOT an enum. Per Catalog Contract
 	// §"Vertical Templates", item_type is vertical-specific and the merchant
@@ -264,10 +270,27 @@ func DefaultCatalogEntityContractDescriptor() CatalogEntityContractDescriptor {
 		// values (draft, active, inactive, archived, expired). We expose
 		// them as a single ItemStatuses map for the frontend's item-status
 		// badges (and the archived-state restore flow).
+		CatalogStatuses: map[string]string{
+			"draft":    "مسودة",
+			"active":   "نشط",
+			"archived": "مؤرشف",
+		},
 		ItemStatuses: map[string]string{
 			"draft":    "مسودة",
 			"active":   "نشط",
 			"inactive": "غير نشط",
+			"archived": "مؤرشف",
+		},
+		VariantStatuses: map[string]string{
+			"active":   "نشط",
+			"inactive": "غير نشط",
+			"archived": "مؤرشف",
+		},
+		OfferStatuses: map[string]string{
+			"draft":    "مسودة",
+			"active":   "نشط",
+			"inactive": "غير نشط",
+			"expired":  "منتهي",
 			"archived": "مؤرشف",
 		},
 		Relationships: []EntityRelationship{
@@ -286,9 +309,29 @@ func DefaultCatalogEntityContractDescriptor() CatalogEntityContractDescriptor {
 // across all batches and is sent once per AI Runtime invocation.
 //
 // The payload contains ONLY definitions and descriptors; no merchant data.
+type CatalogAIEntityContractDescriptor struct {
+	PricingModes              []string                    `json:"pricing_modes"`
+	AvailabilityModes         []string                    `json:"availability_modes"`
+	AvailabilityStatuses      []string                    `json:"availability_statuses"`
+	PriceVerificationStatuses []string                    `json:"price_verification_statuses"`
+	FulfillmentModes          []string                    `json:"fulfillment_modes"`
+	CatalogStatuses           []string                    `json:"catalog_statuses"`
+	ItemStatuses              []string                    `json:"item_statuses"`
+	VariantStatuses           []string                    `json:"variant_statuses"`
+	OfferStatuses             []string                      `json:"offer_statuses"`
+	SemanticRules             []string                      `json:"semantic_rules"`
+	Relationships             []CatalogAIEntityRelationship `json:"relationships"`
+}
+
+type CatalogAIEntityRelationship struct {
+	From        string `json:"from"`
+	To          string `json:"to"`
+	Cardinality string `json:"cardinality"`
+}
+
 type CatalogEntityContractPayload struct {
-	Contract   CatalogEntityContract           `json:"entity_contract"`
-	Descriptor CatalogEntityContractDescriptor `json:"descriptor"`
+	Contract   CatalogEntityContract             `json:"entity_contract"`
+	Descriptor CatalogAIEntityContractDescriptor `json:"descriptor"`
 }
 
 // BuildCatalogEntityContractPayload returns the canonical payload to send to
@@ -306,6 +349,7 @@ func BuildCatalogEntityContractPayload() CatalogEntityContractPayload {
 				ID:          "UUID",
 				Name:        "TEXT",
 				Description: "TEXT?",
+				Status:      "draft|active|archived",
 			},
 			CatalogItem: CatalogItemEntityDefinition{
 				ID:                     "UUID",
@@ -334,7 +378,6 @@ func BuildCatalogEntityContractPayload() CatalogEntityContractPayload {
 					Label:           "TEXT (display)",
 					DataType:        "text|number|boolean|date|datetime|select|multi_select|location|money",
 					IsRequired:      false,
-					IsSearchable:    false,
 					ValidationRules: map[string]any{"rule_key": "rule_value"},
 					DisplayOrder:    0,
 				}},
@@ -346,7 +389,6 @@ func BuildCatalogEntityContractPayload() CatalogEntityContractPayload {
 				Label:           "TEXT (display)",
 				DataType:        "text|number|boolean|date|datetime|select|multi_select|location|money",
 				IsRequired:      false,
-				IsSearchable:    false,
 				ValidationRules: map[string]any{"rule_key": "rule_value"},
 				DisplayOrder:    0,
 			},
@@ -364,6 +406,7 @@ func BuildCatalogEntityContractPayload() CatalogEntityContractPayload {
 			//   CHECK (status IN ('draft', 'active', 'inactive', 'expired', 'archived'))
 			Offer: OfferEntityDefinition{
 				ID:                      "UUID",
+				CatalogItemID:           "UUID",
 				VariantID:               entityContractStrPtr("UUID?"),
 				Name:                    "TEXT",
 				PricingMode:             "fixed|starting_from|per_unit|per_person|per_day|quote_required|dynamic",
@@ -385,8 +428,46 @@ func BuildCatalogEntityContractPayload() CatalogEntityContractPayload {
 				Status:                  "draft|active|inactive|expired|archived",
 			},
 		},
-		Descriptor: DefaultCatalogEntityContractDescriptor(),
+		Descriptor: compactCatalogEntityContractDescriptor(DefaultCatalogEntityContractDescriptor()),
 	}
+}
+
+func compactCatalogEntityContractDescriptor(rich CatalogEntityContractDescriptor) CatalogAIEntityContractDescriptor {
+	relationships := make([]CatalogAIEntityRelationship, 0, len(rich.Relationships))
+	for _, rel := range rich.Relationships {
+		relationships = append(relationships, CatalogAIEntityRelationship{
+			From: rel.From, To: rel.To, Cardinality: rel.Cardinality,
+		})
+	}
+	return CatalogAIEntityContractDescriptor{
+		PricingModes:              sortedContractKeys(rich.PricingModes),
+		AvailabilityModes:         sortedContractKeys(rich.AvailabilityModes),
+		AvailabilityStatuses:      sortedContractKeys(rich.AvailabilityStatuses),
+		PriceVerificationStatuses: sortedContractKeys(rich.PriceVerificationStatuses),
+		FulfillmentModes:          sortedContractKeys(rich.FulfillmentModes),
+		CatalogStatuses:           sortedContractKeys(rich.CatalogStatuses),
+		ItemStatuses:              sortedContractKeys(rich.ItemStatuses),
+		VariantStatuses:           sortedContractKeys(rich.VariantStatuses),
+		OfferStatuses:             sortedContractKeys(rich.OfferStatuses),
+		SemanticRules: []string{
+			"starting_from amount is a lower bound, not a final price",
+			"quote_required has no confirmed numeric price",
+			"dynamic price requires current verification before presenting it as confirmed",
+			"price_verification rejected is unusable; stale or unverified is not confirmed",
+			"availability unknown, stale, or requires_check is not confirmed available",
+			"fulfillment_mode is a default mode, not a fulfillment promise",
+		},
+		Relationships: relationships,
+	}
+}
+
+func sortedContractKeys(values map[string]string) []string {
+	out := make([]string, 0, len(values))
+	for key := range values {
+		out = append(out, key)
+	}
+	sort.Strings(out)
+	return out
 }
 
 func entityContractStrPtr(s string) *string { return &s }

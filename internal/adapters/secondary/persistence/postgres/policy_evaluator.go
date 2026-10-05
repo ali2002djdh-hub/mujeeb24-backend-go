@@ -82,8 +82,9 @@ func NewPostgresCustomerSalesPolicyEvaluator(management ports.BusinessManagement
 func (e *PostgresCustomerSalesPolicyEvaluator) Evaluate(ctx context.Context, proposal ports.CustomerSalesProposal, contextValue *ports.CustomerSalesContext) ports.CustomerSalesPolicyDecision {
 	if e == nil || e.Management == nil {
 		return ports.CustomerSalesPolicyDecision{
-			Decision: "allowed",
-			Reason:   "no customer sales policy repository configured; defaulting to allowed per contract ⑥ §12",
+			Decision:      "requires_approval",
+			RequiresHuman: true,
+			Reason:        "customer sales policy repository is unavailable; requiring human approval",
 		}
 	}
 

@@ -5,7 +5,6 @@ CREATE TABLE attribute_definitions (
     label            TEXT NOT NULL,
     data_type        TEXT NOT NULL,
     is_required      BOOLEAN NOT NULL,
-    is_searchable    BOOLEAN NOT NULL,
     validation_rules JSONB NOT NULL DEFAULT '{}'::jsonb,
     display_order    INTEGER NOT NULL,
     created_at       TIMESTAMPTZ NOT NULL,

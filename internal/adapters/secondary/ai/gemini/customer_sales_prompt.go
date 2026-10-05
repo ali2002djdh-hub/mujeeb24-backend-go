@@ -32,7 +32,8 @@ type customerSalesPromptContext struct {
 	Conversation           ports.CustomerSalesContextConversation      `json:"conversation"`
 	Customer               customerSalesPromptCustomer                 `json:"customer"`
 	CatalogEvidence        []ports.CustomerSalesCatalogEvidence        `json:"catalog_evidence"`
-	CatalogSummary         []ports.CustomerSalesCatalogSummaryEntry    `json:"catalog_summary,omitempty"`
+	CatalogSchemaEvidence  []ports.CustomerSalesCatalogSchemaEvidence `json:"catalog_schema_evidence,omitempty"`
+	CatalogManifest        *ports.CatalogAIManifest                     `json:"catalog_manifest,omitempty"`
 	OfferEvidence          []ports.CustomerSalesOfferEvidence          `json:"offer_evidence"`
 	VariantEvidence        []ports.CustomerSalesVariantEvidence        `json:"variant_evidence"`
 	KnowledgeEvidence      []ports.CustomerSalesKnowledgeEvidence      `json:"knowledge_evidence"`
@@ -42,7 +43,6 @@ type customerSalesPromptContext struct {
 	KnowledgeState         string                                      `json:"knowledge_state"`
 	ConversationState      *ports.ConversationStateRecord              `json:"conversation_state,omitempty"`
 	ConversationSummary    string                                      `json:"conversation_summary,omitempty"`
-	CatalogNames           []string                                    `json:"catalog_names,omitempty"`
 	GeneratedAt            time.Time                                   `json:"generated_at"`
 	ExpiresAt              time.Time                                   `json:"expires_at"`
 }
@@ -65,7 +65,8 @@ func customerSalesPromptContextFrom(value *ports.CustomerSalesContext) customerS
 			Status:           value.Customer.Status,
 		},
 		CatalogEvidence:        value.CatalogEvidence,
-		CatalogSummary:         value.CatalogSummary,
+		CatalogSchemaEvidence:  value.CatalogSchemaEvidence,
+		CatalogManifest:        value.CatalogManifest,
 		OfferEvidence:          value.OfferEvidence,
 		VariantEvidence:        value.VariantEvidence,
 		KnowledgeEvidence:      value.KnowledgeEvidence,
@@ -75,8 +76,41 @@ func customerSalesPromptContextFrom(value *ports.CustomerSalesContext) customerS
 		KnowledgeState:         value.KnowledgeState,
 		ConversationState:      value.ConversationState,
 		ConversationSummary:    value.ConversationSummary,
-		CatalogNames:           value.CatalogNames,
 		GeneratedAt:            value.GeneratedAt,
 		ExpiresAt:              value.ExpiresAt,
+	}
+}
+
+
+type catalogBatchPromptContext struct {
+	Business               ports.CustomerSalesContextBusiness          `json:"business"`
+	Conversation           ports.CustomerSalesContextConversation      `json:"conversation"`
+	Customer               customerSalesPromptCustomer                 `json:"customer"`
+	KnowledgeEvidence      []ports.CustomerSalesKnowledgeEvidence      `json:"knowledge_evidence,omitempty"`
+	BusinessPolicyEvidence []ports.CustomerSalesBusinessPolicyEvidence `json:"business_policy_evidence,omitempty"`
+	RecentMessages         []ports.CustomerSalesRecentMessageEvidence  `json:"recent_messages,omitempty"`
+	PolicyEvidence         ports.CustomerSalesPolicyEvidence           `json:"policy_evidence"`
+	ConversationState      *ports.ConversationStateRecord              `json:"conversation_state,omitempty"`
+	ConversationSummary    string                                      `json:"conversation_summary,omitempty"`
+}
+
+func catalogBatchPromptContextFrom(value *ports.CustomerSalesContext) catalogBatchPromptContext {
+	if value == nil {
+		return catalogBatchPromptContext{}
+	}
+	return catalogBatchPromptContext{
+		Business:      value.Business,
+		Conversation:  value.Conversation,
+		Customer: customerSalesPromptCustomer{
+			Reference:        value.Customer.Reference,
+			LocalePreference: value.Customer.LocalePreference,
+			Status:           value.Customer.Status,
+		},
+		KnowledgeEvidence:      value.KnowledgeEvidence,
+		BusinessPolicyEvidence: value.BusinessPolicyEvidence,
+		RecentMessages:         value.RecentMessages,
+		PolicyEvidence:         value.PolicyEvidence,
+		ConversationState:      value.ConversationState,
+		ConversationSummary:    value.ConversationSummary,
 	}
 }

@@ -152,11 +152,9 @@ func TestAICostProtectionAllowsWhenRuntimeEnabled(t *testing.T) {
 	}
 }
 
-// Test P0-2: when PlatformOperations is nil (not wired), the runtime
-// check is skipped — fail-open. This preserves operability during
-// bootstrap or in tests that don't wire platform ops. The cost
-// budget + entitlement checks still run.
-func TestAICostProtectionFailsOpenWhenPlatformOpsNil(t *testing.T) {
+// Missing runtime-state protection blocks Auto AI while leaving non-AI
+// webhook processing untouched.
+func TestAICostProtectionFailsClosedWhenPlatformOpsNil(t *testing.T) {
 	t.Parallel()
 	svc := &AICostProtectionService{
 		Subscriptions: &stubSubscriptionsRepo{
@@ -170,15 +168,17 @@ func TestAICostProtectionFailsOpenWhenPlatformOpsNil(t *testing.T) {
 		},
 		// PlatformOperations: nil
 	}
-	allowed, _ := svc.IsAIExecutionAllowed(context.Background(), "b-1")
-	if !allowed {
-		t.Errorf("expected allowed=true when platform ops not wired (fail-open), got false")
+	allowed, reason := svc.IsAIExecutionAllowed(context.Background(), "b-1")
+	if allowed {
+		t.Errorf("expected allowed=false when platform ops is not wired")
+	}
+	if reason != "ai_runtime_state_unavailable" {
+		t.Errorf("expected ai_runtime_state_unavailable, got %q", reason)
 	}
 }
 
-// Test P0-2: when the runtime checker errors out, fail-open (operability).
-// The platform admin can monitor via the AI Overview endpoint.
-func TestAICostProtectionFailsOpenOnRuntimeCheckerError(t *testing.T) {
+// Runtime-state lookup failure blocks only Auto AI.
+func TestAICostProtectionFailsClosedOnRuntimeCheckerError(t *testing.T) {
 	t.Parallel()
 	svc := &AICostProtectionService{
 		Subscriptions: &stubSubscriptionsRepo{
@@ -195,9 +195,12 @@ func TestAICostProtectionFailsOpenOnRuntimeCheckerError(t *testing.T) {
 			err:   errors.New("registry unavailable"),
 		},
 	}
-	allowed, _ := svc.IsAIExecutionAllowed(context.Background(), "b-1")
-	if !allowed {
-		t.Errorf("expected allowed=true on checker error (fail-open), got false")
+	allowed, reason := svc.IsAIExecutionAllowed(context.Background(), "b-1")
+	if allowed {
+		t.Errorf("expected allowed=false on runtime checker error")
+	}
+	if reason != "ai_runtime_state_unavailable" {
+		t.Errorf("expected ai_runtime_state_unavailable, got %q", reason)
 	}
 }
 
@@ -281,10 +284,8 @@ func TestAICostProtectionRuntimeCheckBeatsAllOtherChecks(t *testing.T) {
 	}
 }
 
-// Test P0-3: when no active subscription, fail-open (entitlement not yet
-// enforceable — e.g., a brand-new business without a subscription). The
-// backend's subscription creation flow handles this elsewhere.
-func TestAICostProtectionAllowsWhenNoActiveSubscription(t *testing.T) {
+// Contract §29: without an ACTIVE subscription, merchant AI entitlements stop.
+func TestAICostProtectionBlocksWhenNoActiveSubscription(t *testing.T) {
 	t.Parallel()
 	svc := &AICostProtectionService{
 		Subscriptions: &stubSubscriptionsRepo{
@@ -293,8 +294,42 @@ func TestAICostProtectionAllowsWhenNoActiveSubscription(t *testing.T) {
 		AIUsage:            &stubAIUsageRepo{},
 		PlatformOperations: &stubPlatformOperationsRepo{state: ports.AIRuntimeState{AdminState: ports.ProviderAdminEnabled}},
 	}
-	allowed, _ := svc.IsAIExecutionAllowed(context.Background(), "b-1")
-	if !allowed {
-		t.Errorf("expected allowed=true when no active subscription (fail-open), got false")
+	allowed, reason := svc.IsAIExecutionAllowed(context.Background(), "b-1")
+	if allowed {
+		t.Errorf("expected allowed=false when no active subscription")
+	}
+	if reason != "active_subscription_required" {
+		t.Errorf("expected active_subscription_required, got %q", reason)
+	}
+}
+
+func TestAICostProtectionNilServiceFailsClosed(t *testing.T) {
+	var svc *AICostProtectionService
+	allowed, reason := svc.IsAIExecutionAllowed(context.Background(), "b-1")
+	if allowed {
+		t.Fatal("nil cost protection service must not allow AI execution")
+	}
+	if reason != "ai_cost_protection_unavailable" {
+		t.Fatalf("unexpected reason: %q", reason)
+	}
+}
+
+func TestAICostProtectionFailsClosedOnUsageLookupError(t *testing.T) {
+	t.Parallel()
+	svc := &AICostProtectionService{
+		Subscriptions: &stubSubscriptionsRepo{
+			items: []ports.SubscriptionRecord{{ID: "sub-1", BusinessID: "b-1", Status: "ACTIVE"}},
+		},
+		AIUsage: &stubAIUsageRepo{err: errors.New("usage db unavailable")},
+		PlatformOperations: &stubPlatformOperationsRepo{
+			state: ports.AIRuntimeState{AdminState: ports.ProviderAdminEnabled},
+		},
+	}
+	allowed, reason := svc.IsAIExecutionAllowed(context.Background(), "b-1")
+	if allowed {
+		t.Errorf("expected allowed=false when usage check fails")
+	}
+	if reason != "ai_usage_check_unavailable" {
+		t.Errorf("expected ai_usage_check_unavailable, got %q", reason)
 	}
 }

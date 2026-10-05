@@ -17,12 +17,11 @@ type listItemsCapability struct {
 func (c listItemsCapability) Definition() MerchantCatalogDiscoveryToolDefinition {
 	return MerchantCatalogDiscoveryToolDefinition{
 		Name:        "merchant_catalog_list_items",
-		Description: "Read items from the already selected merchant catalog. This is bounded factual retrieval, not semantic search. The catalog is selected by Mujeeb; the model must not choose it.",
+		Description: "Read a bounded page of items from the already selected merchant catalog in storage order. The catalog is selected by Mujeeb; the model must not choose it.",
 		Parameters: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
 				"status": map[string]any{"type": "string"},
-				"search": map[string]any{"type": "string", "description": "Deterministic name/text filter; not semantic search."},
 				"limit":  map[string]any{"type": "integer"},
 				"cursor": map[string]any{"type": "string"},
 			},
@@ -41,9 +40,8 @@ func (c listItemsCapability) Execute(ctx context.Context, execCtx MerchantCatalo
 	}
 
 	status, _ := params["status"].(string)
-	search, _ := params["search"].(string)
 	cursor, _ := params["cursor"].(string)
-	page, err := c.repository.ListCatalogItems(ctx, execCtx.BusinessID, c.selectedCatalogID, strings.TrimSpace(search), status, readLimit(params), cursor)
+	page, err := c.repository.ListCatalogItems(ctx, execCtx.BusinessID, c.selectedCatalogID, "", status, readLimit(params), cursor)
 	if err != nil {
 		return MerchantCatalogDiscoveryResult{}, err
 	}

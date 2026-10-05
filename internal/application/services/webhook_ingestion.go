@@ -251,12 +251,14 @@ func (s SocialAPIWebhookService) Handle(ctx context.Context, command commands.In
 				// EXCEEDED, no new Auto AI Execution starts. Human replies,
 				// dashboard, customer data, leads, orders, and channel
 				// reception continue to work normally.
-				if s.AICostProtectionChecker != nil {
-					allowed, reason := s.AICostProtectionChecker.IsAIExecutionAllowed(ctx, connection.BusinessID)
-					if !allowed {
-						log.Printf("[Webhook] AUTO_REPLY_BLOCKED business=%s conversation=%s reason=%s", connection.BusinessID, materialized.ConversationID, reason)
-						continue
-					}
+				if s.AICostProtectionChecker == nil {
+					log.Printf("[Webhook] AUTO_REPLY_BLOCKED business=%s conversation=%s reason=ai_cost_protection_unavailable", connection.BusinessID, materialized.ConversationID)
+					continue
+				}
+				allowed, reason := s.AICostProtectionChecker.IsAIExecutionAllowed(ctx, connection.BusinessID)
+				if !allowed {
+					log.Printf("[Webhook] AUTO_REPLY_BLOCKED business=%s conversation=%s reason=%s", connection.BusinessID, materialized.ConversationID, reason)
+					continue
 				}
 				log.Printf("[Webhook] AUTO_REPLY_TRIGGER business=%s conversation=%s text=%q", connection.BusinessID, materialized.ConversationID, truncate(event.Text, 60))
 				// Run AutoReply in a detached context with a generous timeout.

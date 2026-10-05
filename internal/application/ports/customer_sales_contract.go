@@ -34,6 +34,14 @@ const (
 // "clarification" (not "ask_clarification"), "lead_draft" (not "create_lead"),
 // "order_draft" (not "create_transaction_draft"). Migration 000056 aligns the
 // ai_decisions table accordingly.
+type CustomerSalesRoutingReason string
+
+const (
+	CustomerSalesRoutingReasonSubscriptionActivation CustomerSalesRoutingReason = "subscription_activation"
+	CustomerSalesRoutingReasonCustomerRequestedHuman CustomerSalesRoutingReason = "customer_requested_human"
+	CustomerSalesRoutingReasonOther                  CustomerSalesRoutingReason = "other"
+)
+
 type CustomerSalesProposalAction string
 
 const (
@@ -82,10 +90,11 @@ type CatalogBatchCandidate struct {
 //
 // Such fields are Mujeeb's responsibility and live in EffectiveDecision.
 type CustomerSalesProposal struct {
-	Status       CustomerSalesProposalStatus `json:"status"`
-	Action       CustomerSalesProposalAction `json:"action"`
-	ResponseText string                      `json:"response_text"`
-	Selected     []SelectedReference         `json:"selected,omitempty"`
+	Status        CustomerSalesProposalStatus `json:"status"`
+	Action        CustomerSalesProposalAction `json:"action"`
+	ResponseText  string                      `json:"response_text"`
+	RoutingReason CustomerSalesRoutingReason  `json:"routing_reason,omitempty"`
+	Selected      []SelectedReference         `json:"selected,omitempty"`
 }
 
 // CatalogBatchResult is the contract ② §5 per-batch evaluation output.

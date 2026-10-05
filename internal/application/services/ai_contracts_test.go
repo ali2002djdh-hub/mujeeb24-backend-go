@@ -296,3 +296,30 @@ func TestCatalogEntityContractDescriptor(t *testing.T) {
 		}
 	}
 }
+
+
+func TestValidateStructuralRejectsRoutingReasonOutsideHumanRequest(t *testing.T) {
+	pipeline := &ValidationPipeline{}
+	err := pipeline.validateStructural(ports.CustomerSalesProposal{
+		Status:        ports.CustomerSalesProposalStatusResolved,
+		Action:        ports.CustomerSalesProposalActionAnswer,
+		ResponseText:  "ok",
+		RoutingReason: ports.CustomerSalesRoutingReasonOther,
+	})
+	if err == nil {
+		t.Fatal("expected routing_reason outside human_request to be rejected")
+	}
+}
+
+func TestValidateStructuralRejectsNotFoundWithSelectedReferences(t *testing.T) {
+	pipeline := &ValidationPipeline{}
+	err := pipeline.validateStructural(ports.CustomerSalesProposal{
+		Status:       ports.CustomerSalesProposalStatusNotFound,
+		Action:       ports.CustomerSalesProposalActionAnswer,
+		ResponseText: "غير موجود",
+		Selected:     []ports.SelectedReference{{ItemID: "item-1"}},
+	})
+	if err == nil {
+		t.Fatal("expected not_found with selected references to be rejected")
+	}
+}

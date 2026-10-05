@@ -6,6 +6,7 @@ on:
     branches:
       - main
       - refactor/merchant-catalog-ai-v2-structure
+      - feat/universal-catalog-ai-v3
   workflow_dispatch:
 
 permissions:

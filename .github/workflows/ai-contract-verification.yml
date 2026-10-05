@@ -6,7 +6,7 @@ on:
       - main
       - feat/ai-contracts-cleanup
       - refactor/merchant-catalog-ai-v2-structure
-      - refactor/merchant-catalog-ai-v2-structure
+      - feat/universal-catalog-ai-v3
   pull_request:
     branches:
       - main

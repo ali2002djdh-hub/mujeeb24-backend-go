@@ -1,0 +1,2 @@
+ALTER TABLE attribute_definitions
+    ADD COLUMN IF NOT EXISTS is_searchable BOOLEAN NOT NULL DEFAULT FALSE;

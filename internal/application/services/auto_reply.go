@@ -49,22 +49,6 @@ const (
 // RequiresHuman=true so the dashboard hands the conversation to staff.
 const HandoffFarewellMessage = "يسعدنا اختيارك! تم استلام طلبك، وسيقوم أحد ممثلي المبيعات بالتواصل معك فوراً لإتمام خطوات التفعيل والربط."
 
-// isSubscriptionHandoffIntent reports whether the model's intent asks to
-// subscribe, activate, or purchase. This is product routing (which farewell
-// flow applies), not reference resolution: it never selects catalog entities.
-func isSubscriptionHandoffIntent(intent string) bool {
-	value := strings.ToLower(strings.TrimSpace(intent))
-	if value == "" {
-		return false
-	}
-	for _, keyword := range []string{"subscri", "activat", "purchase", "اشتراك", "تفعيل", "فعّل", "شراء"} {
-		if strings.Contains(value, keyword) {
-			return true
-		}
-	}
-	return false
-}
-
 // AutoReplyService drives the contract ⑥ post-Gemini flow for one customer turn.
 //
 // Per contract ⑨ §1, each Handle() call is one AI Run.
@@ -86,8 +70,8 @@ type AutoReplyService struct {
 	// ContextBuilder per contract ③ §2 builds the CustomerSalesContext.
 	CustomerSalesContextBuilder ports.CustomerSalesContextBuilder
 
-	// Validation is the contract ⑥ §2 pipeline. If nil, validation is
-	// skipped (defaulting to "allowed"); production deployments MUST wire it.
+	// Validation is the contract ⑥ §2 pipeline. It is mandatory for any
+	// executable AI proposal; nil fails closed before persistence/execution.
 	Validation *ValidationPipeline
 
 	// RunRepository persists AI Run trace per contract ⑧ §5. If nil, the
@@ -227,14 +211,6 @@ func (s AutoReplyService) Handle(ctx context.Context, command commands.AutoReply
 		if st, err := s.StateRepository.Get(ctx, businessID, conversationID); err == nil {
 			loadedState = &st
 		}
-		// Per ADR-051: clear stale focus to prevent scoped retrieval from
-		// loading frozen old product data. The focus was set on Sep 13 and
-		// never updated, causing Gemini to jump to "عطر عمار" when the
-		// customer said "نعم". Clearing it forces broader retrieval mode
-		// (all catalogs) and lets recent_messages provide context instead.
-		if loadedState != nil && loadedState.Focus != nil {
-			loadedState.Focus = nil
-		}
 	}
 	var builtContext *ports.CustomerSalesContext
 	if s.CustomerSalesContextBuilder != nil {
@@ -253,7 +229,7 @@ func (s AutoReplyService) Handle(ctx context.Context, command commands.AutoReply
 			return commands.AutoReplyResult{}, contextErr
 		}
 		log.Printf("[AutoReply] CONTEXT_BUILT business=%s ownership=%s state=%s", businessID, bc.Conversation.Ownership, bc.Conversation.State)
-		log.Printf("[AutoReply] CONTEXT_DEBUG catalog_names=%v catalog_summary_count=%d catalog_evidence_count=%d", bc.CatalogNames, len(bc.CatalogSummary), len(bc.CatalogEvidence))
+		log.Printf("[AutoReply] CONTEXT_DEBUG catalog_manifest_items=%d catalog_evidence_count=%d", catalogManifestItemCount(bc.CatalogManifest), len(bc.CatalogEvidence))
 		// Per contract ③ §1, if conversation is owned by human or waiting for human,
 		// AI does not respond.
 		if strings.EqualFold(bc.Conversation.Ownership, "human") || strings.EqualFold(bc.Conversation.State, "waiting_human") {
@@ -306,29 +282,23 @@ func (s AutoReplyService) Handle(ctx context.Context, command commands.AutoReply
 		return commands.AutoReplyResult{}, err
 	}
 	proposal := out.Proposal
+	interactionIDToPersist := strings.TrimSpace(out.GeminiInteraction.ResultingInteractionID)
+	resetGeminiInteraction := false
 	log.Printf("[AutoReply] GEMINI_OK business=%s status=%s action=%s tokens_in=%d tokens_out=%d latency=%dms response=%q",
 		businessID, proposal.Status, proposal.Action, out.Usage.InputTokens, out.Usage.OutputTokens, out.LatencyMs, truncate(proposal.ResponseText, 200))
 
-	// Per Item 8: persist the resulting Gemini interaction ID so the
-	// next turn can use it as PreviousInteractionID. Per contract ③ §4
-	// + migration 000057: the conversations table has a
-	// last_gemini_interaction_id column. We update it here (after
-	// Gemini success) — this is the canonical write path. The context
-	// builder reads it on the next turn.
-	//
-	// Best-effort: a failure to persist the interaction ID does NOT
-	// fail the AutoReply (the reply is already produced). The next
-	// turn will just not have the chaining (Gemini will start fresh).
-	if s.Conversations != nil && out.GeminiInteraction.ResultingInteractionID != "" {
-		if err := s.Conversations.UpdateLastGeminiInteractionID(ctx, businessID, conversationID, out.GeminiInteraction.ResultingInteractionID); err != nil {
-			log.Printf("[AutoReply] GEMINI_INTERACTION_ID_PERSIST_FAILED business=%s conversation=%s err=%v (continuing — reply already produced)", businessID, conversationID, err)
-		}
-	}
+	// Gemini continuity is persisted only after the effective action is known.
+	// An internal needs_more_data interaction is never stored as the previous
+	// customer-facing turn; the full-catalog path below resets the chain.
+
+	// Exact relational evidence exposed in the normal customer-sales context.
+	// Batch evaluation evidence is merged only after complete batch coverage.
+	catalogEvidence := EvidenceFromCustomerSalesContext(builtContext)
 
 	// Per contract ② §9 — Catalog Evaluation flow.
 	//
-	// When Gemini's first response indicates it needs catalog data
-	// (status=needs_more_data AND the context lacks catalog evidence),
+	// When Gemini's first response indicates it needs more catalog data
+	// (status=needs_more_data),
 	// invoke the CatalogBatchController to:
 	//   1. Build the Catalog AI Projection from PostgreSQL (contract ① §6)
 	//   2. Token-count and split into batches (contract ② §2)
@@ -342,27 +312,42 @@ func (s AutoReplyService) Handle(ctx context.Context, command commands.AutoReply
 	//
 	// Per contract ② "ما أغلقناه": no semantic search, no product matching
 	// inside Mujeeb. Mujeeb only builds the projection and counts tokens.
-	if s.CatalogBatch != nil && proposal.Status == ports.CustomerSalesProposalStatusNeedsMoreData {
+	fullCatalogRequired := proposal.Status == ports.CustomerSalesProposalStatusNeedsMoreData ||
+		proposal.Status == ports.CustomerSalesProposalStatusNotFound ||
+		proposalReferencesOutsideEvidence(proposal, catalogEvidence)
+	if fullCatalogRequired && s.CatalogBatch == nil {
+		err := errors.New("full catalog evaluation is required before needs_more_data/not_found can be finalized, but CatalogBatchController is not configured")
+		s.markFailedSafe(ctx, run, ports.AIRunFailureStageGeminiRequest, string(ports.AIRunFailureCategoryProviderPermanent), err.Error())
+		return commands.AutoReplyResult{Action: "no_action", Enqueued: false}, err
+	}
+	if s.CatalogBatch != nil && fullCatalogRequired {
+		resetGeminiInteraction = true
 		// Per contract ② §9, invoke catalog evaluation whenever Gemini
 		// says it needs more data — regardless of whether some evidence
 		// already exists. The fact that Gemini returned needs_more_data
-		// means the 5-item context summary was insufficient; the batch
+		// means the current context was insufficient; the batch
 		// evaluation will provide the FULL catalog for Gemini to reason over.
 		//
 		// Previous condition `len(builtContext.CatalogEvidence) == 0` was
 		// wrong: the ContextBuilder always puts 5 items in the evidence,
 		// so the condition was never true, and the batch evaluation never ran.
-		log.Printf("[AutoReply] CATALOG_EVAL_TRIGGER run=%s reason=needs_more_data current_evidence=%d", run.ID, len(builtContext.CatalogEvidence))
+		log.Printf("[AutoReply] CATALOG_EVAL_TRIGGER run=%s reason=%s current_evidence=%d", run.ID, proposal.Status, len(builtContext.CatalogEvidence))
 		// Per contract ⑨ §3, mark RUNNING again (back from VALIDATING
 		// to RUNNING for the batch evaluation loop).
 		s.markRunningSafe(ctx, run)
 
 		// Per contract ② §9, run the full catalog evaluation pipeline.
 		entityContract := CatalogEntityContractPayload{}
-		if len(s.EntityContractPayload) > 0 {
-			_ = json.Unmarshal(s.EntityContractPayload, &entityContract)
+		if len(s.EntityContractPayload) == 0 {
+			err := errors.New("catalog entity contract payload is required for full catalog evaluation")
+			s.markFailedSafe(ctx, run, ports.AIRunFailureStageContextBuild, string(ports.AIRunFailureCategoryInfrastructure), err.Error())
+			return commands.AutoReplyResult{Action: "no_action", Enqueued: false}, err
 		}
-		finalProposal, err := s.CatalogBatch.RunCatalogEvaluation(ctx, CatalogEvaluationInput{
+		if err := json.Unmarshal(s.EntityContractPayload, &entityContract); err != nil {
+			s.markFailedSafe(ctx, run, ports.AIRunFailureStageContextBuild, string(ports.AIRunFailureCategoryInfrastructure), "decode catalog entity contract: "+err.Error())
+			return commands.AutoReplyResult{Action: "no_action", Enqueued: false}, fmt.Errorf("decode catalog entity contract: %w", err)
+		}
+		catalogResult, err := s.CatalogBatch.RunCatalogEvaluation(ctx, CatalogEvaluationInput{
 			AIRunID:             run.ID,
 			AttemptID:           "", // no separate attempt tracking in this path
 			BusinessID:          businessID,
@@ -375,10 +360,22 @@ func (s AutoReplyService) Handle(ctx context.Context, command commands.AutoReply
 		if err != nil {
 			log.Printf("[AutoReply] CATALOG_EVAL_FAILED run=%s err=%v", run.ID, err)
 			s.markFailedSafe(ctx, run, ports.AIRunFailureStageGeminiRequest, string(ports.AIRunFailureCategoryProviderPermanent), "catalog evaluation: "+err.Error())
+			return commands.AutoReplyResult{Action: "no_action", Enqueued: false}, fmt.Errorf("catalog evaluation failed: %w", err)
 		} else {
-			log.Printf("[AutoReply] CATALOG_EVAL_OK run=%s final_status=%s final_action=%s response=%q", run.ID, finalProposal.Status, finalProposal.Action, truncate(finalProposal.ResponseText, 200))
-			proposal = finalProposal
+			log.Printf("[AutoReply] CATALOG_EVAL_OK run=%s final_status=%s final_action=%s response=%q", run.ID, catalogResult.Proposal.Status, catalogResult.Proposal.Action, truncate(catalogResult.Proposal.ResponseText, 200))
+			proposal = catalogResult.Proposal
+			catalogEvidence.Merge(catalogResult.Evidence)
 		}
+	}
+
+	// needs_more_data is an internal retrieval signal, never an executable
+	// customer-facing decision. By this point the catalog path has either run
+	// to complete coverage or failed above; allowing this status to continue
+	// could turn an unresolved model response into an outbound message.
+	if proposal.Status == ports.CustomerSalesProposalStatusNeedsMoreData {
+		err := errors.New("AI proposal remained needs_more_data after catalog evaluation")
+		s.markFailedSafe(ctx, run, ports.AIRunFailureStageValidation, string(ports.AIRunFailureCategoryInvalidAIOutput), err.Error())
+		return commands.AutoReplyResult{Action: "no_action", Enqueued: false}, err
 	}
 
 	// Per contract ⑨ §3, mark VALIDATING.
@@ -389,36 +386,20 @@ func (s AutoReplyService) Handle(ctx context.Context, command commands.AutoReply
 	// Per contract ⑥ §10, evidence IDs = what was actually sent to Gemini.
 	// When the CatalogBatchController ran, it sent the FULL catalog projection
 	// (items + variants + offers) to Gemini. The evidence set must include
-	// ALL of those — not just the 5 items from the initial context.
+	// ALL of those — not only the initial context evidence.
 	var effective ports.EffectiveDecision
 	if s.Validation != nil {
-		// Start with the context evidence (5 items from ContextBuilder).
-		evidenceItemIDs := extractItemIDs(builtContext)
-		evidenceVariantIDs := extractVariantIDs(builtContext)
-		evidenceOfferIDs := extractOfferIDs(builtContext)
-		// If catalog batch evaluation ran, add ALL items from the projection
-		// to the evidence set. The batch controller sent all items to Gemini
-		// via EvaluateBatch; those are now valid references.
-		// We also add the selected item IDs from the proposal — if Gemini
-		// selected them, they were in the batch data it received.
-		for _, ref := range proposal.Selected {
-			evidenceItemIDs = appendUniqueString(evidenceItemIDs, ref.ItemID)
-			if ref.VariantID != nil && *ref.VariantID != "" {
-				evidenceVariantIDs = appendUniqueString(evidenceVariantIDs, *ref.VariantID)
-			}
-			if ref.OfferID != nil && *ref.OfferID != "" {
-				evidenceOfferIDs = appendUniqueString(evidenceOfferIDs, *ref.OfferID)
-			}
-		}
+		// Universal Catalog AI v3: evidence contains only entities that Mujeeb
+		// actually serialized into the normal context or completed catalog batches.
+		// AI output never expands this trust boundary.
+
 		ed, failure := s.Validation.Validate(ctx, ValidationInput{
 			DecisionID:         "", // linked later when ai_decisions is created
 			BusinessID:         businessID,
 			ConversationID:     conversationID,
 			Proposal:           proposal,
 			Context:            builtContext,
-			EvidenceItemIDs:    evidenceItemIDs,
-			EvidenceVariantIDs: evidenceVariantIDs,
-			EvidenceOfferIDs:   evidenceOfferIDs,
+			Evidence:           catalogEvidence,
 		})
 		if failure != nil {
 			log.Printf("[AutoReply] VALIDATION_FAILED run=%s stage=%s category=%s reason=%s", run.ID, failure.Stage, failure.Category, failure.Reason)
@@ -461,27 +442,22 @@ func (s AutoReplyService) Handle(ctx context.Context, command commands.AutoReply
 		}
 		effective = ed
 	} else {
-		// No validation configured — default to allowed (test convenience).
-		effective = ports.EffectiveDecision{
-			EffectiveAction: string(proposal.Action),
-			PolicyDecision:  "allowed",
-		}
+		err := errors.New("validation pipeline is required for AutoReply")
+		s.markFailedSafe(ctx, run, ports.AIRunFailureStageValidation, string(ports.AIRunFailureCategoryInvalidAIOutput), err.Error())
+		return commands.AutoReplyResult{Action: "no_action", Enqueued: false}, err
 	}
 
 	// Per contract ⑥ §14, handoff for subscription/activation requests uses
 	// fixed Mujeeb-owned farewell (never model text). This is product routing,
 	// not reference resolution.
 	//
-	// Per contract ④ §4, the model returns one of the closed status values
-	// (resolved/ambiguous/not_found/needs_more_data). None of these directly
-	// convey "subscription" intent, so we infer it from ResponseText (which
-	// the model produces per its system prompt). This is product routing,
-	// not reference resolution.
+	// Subscription/activation routing is structured model output. Mujeeb
+	// never infers it from response_text, avoiding text-based false positives.
 	farewellHandoff := false
 	var farewellReasonCodes []string
 	if proposal.Action == ports.CustomerSalesProposalActionHumanRequest &&
 		effective.PolicyDecision == "allowed" &&
-		isSubscriptionHandoffIntent(proposal.ResponseText) {
+		proposal.RoutingReason == ports.CustomerSalesRoutingReasonSubscriptionActivation {
 		farewellHandoff = true
 		// Override the proposal's response text with the fixed farewell and
 		// the action to "answer" so the sendable check enqueues the message.
@@ -680,6 +656,33 @@ func (s AutoReplyService) Handle(ctx context.Context, command commands.AutoReply
 		log.Printf("[AutoReply] EXECUTE_FAILED business=%s err=%v", businessID, err)
 		s.markFailedSafe(ctx, run, ports.AIRunFailureStageExecution, string(ports.AIRunFailureCategoryExecutionFailure), err.Error())
 		return commands.AutoReplyResult{}, err
+	}
+
+	// Persist deterministic conversation focus from the validated proposal.
+	// This is especially important after full-catalog evaluation, where the
+	// provider interaction chain is intentionally reset. State is derived only
+	// from validated selected[] IDs; no text inference or semantic rematching.
+	if s.StateRepository != nil {
+		if stateErr := s.persistValidatedProposalState(ctx, loadedState, businessID, conversationID, proposal, builtContext); stateErr != nil {
+			log.Printf("[AutoReply] CONVERSATION_STATE_PERSIST_FAILED business=%s conversation=%s err=%v", businessID, conversationID, stateErr)
+		}
+	}
+
+	// Persist Gemini server-side continuity only when it matches the canonical
+	// customer-facing history. The full-catalog final response is generated by
+	// a separate provider call, so its initial needs_more_data interaction must
+	// not become the next turn's previous_interaction_id.
+	if s.Conversations != nil {
+		switch {
+		case resetGeminiInteraction:
+			if err := s.Conversations.UpdateLastGeminiInteractionID(ctx, businessID, conversationID, ""); err != nil {
+				log.Printf("[AutoReply] GEMINI_INTERACTION_ID_RESET_FAILED business=%s conversation=%s err=%v", businessID, conversationID, err)
+			}
+		case result.Enqueued && !farewellHandoff && interactionIDToPersist != "":
+			if err := s.Conversations.UpdateLastGeminiInteractionID(ctx, businessID, conversationID, interactionIDToPersist); err != nil {
+				log.Printf("[AutoReply] GEMINI_INTERACTION_ID_PERSIST_FAILED business=%s conversation=%s err=%v", businessID, conversationID, err)
+			}
+		}
 	}
 
 	// Per contract ⑨ §31, Mark COMPLETED.
@@ -954,6 +957,15 @@ func encodeProposalSelectedAsJSON(selected []ports.SelectedReference) []byte {
 // derefCustomerSalesContext safely dereferences a *ports.CustomerSalesContext, returning a zero
 // value if nil. Used when passing the context to CatalogBatchController
 // which expects a value (not a pointer).
+func proposalReferencesOutsideEvidence(proposal ports.CustomerSalesProposal, evidence ports.CatalogAIEvidenceSet) bool {
+	for _, ref := range proposal.Selected {
+		if !evidence.ContainsSelection(ref) {
+			return true
+		}
+	}
+	return false
+}
+
 func derefCustomerSalesContext(ctx *ports.CustomerSalesContext) ports.CustomerSalesContext {
 	if ctx == nil {
 		return ports.CustomerSalesContext{}
@@ -1008,6 +1020,100 @@ func uuidStringPointer(value string) *string {
 func pointerTo(value time.Time) *time.Time { return &value }
 
 // truncate shortens a string for logging, appending "..." if truncated.
+func (s *AutoReplyService) persistValidatedProposalState(
+	ctx context.Context,
+	current *ports.ConversationStateRecord,
+	businessID string,
+	conversationID string,
+	proposal ports.CustomerSalesProposal,
+	context *ports.CustomerSalesContext,
+) error {
+	if s.StateRepository == nil || len(proposal.Selected) == 0 {
+		return nil
+	}
+
+	next := ports.ConversationStateRecord{
+		BusinessID:     businessID,
+		ConversationID: conversationID,
+	}
+	if current != nil {
+		next = *current
+		next.BusinessID = businessID
+		next.ConversationID = conversationID
+	}
+
+	itemName := func(itemID string) *string {
+		if context == nil {
+			return nil
+		}
+		for _, item := range context.CatalogEvidence {
+			if item.Reference == itemID && strings.TrimSpace(item.Name) != "" {
+				name := item.Name
+				return &name
+			}
+		}
+		return nil
+	}
+
+	if len(proposal.Selected) == 1 {
+		ref := proposal.Selected[0]
+		itemID := ref.ItemID
+		focus := &ports.ConversationFocus{
+			Type: "item",
+			ID:   itemID,
+			Name: itemName(itemID),
+		}
+		if ref.VariantID != nil && strings.TrimSpace(*ref.VariantID) != "" {
+			variantID := strings.TrimSpace(*ref.VariantID)
+			focus.Type = "variant"
+			focus.ID = variantID
+			focus.ItemID = &itemID
+		}
+		if ref.OfferID != nil && strings.TrimSpace(*ref.OfferID) != "" {
+			offerID := strings.TrimSpace(*ref.OfferID)
+			focus.Type = "offer"
+			focus.ID = offerID
+			focus.ItemID = &itemID
+		}
+		if next.Focus != nil && (next.Focus.Type != focus.Type || next.Focus.ID != focus.ID) {
+			next.Previous = append(next.Previous, *next.Focus)
+			if len(next.Previous) > 8 {
+				next.Previous = append([]ports.ConversationFocus(nil), next.Previous[len(next.Previous)-8:]...)
+			}
+		}
+		next.Focus = focus
+		next.Comparison = nil
+	} else {
+		ids := make([]string, 0, len(proposal.Selected))
+		seen := make(map[string]struct{}, len(proposal.Selected))
+		for _, ref := range proposal.Selected {
+			id := ref.ItemID
+			if ref.OfferID != nil && strings.TrimSpace(*ref.OfferID) != "" {
+				id = strings.TrimSpace(*ref.OfferID)
+			}
+			if _, ok := seen[id]; ok || strings.TrimSpace(id) == "" {
+				continue
+			}
+			seen[id] = struct{}{}
+			ids = append(ids, id)
+		}
+		if len(ids) >= 2 {
+			next.Comparison = &ports.ConversationComparison{Type: "selected_set", IDs: ids}
+			next.Focus = nil
+		}
+	}
+
+	_, err := s.StateRepository.UpsertValidated(ctx, next)
+	return err
+}
+
+func catalogManifestItemCount(manifest *ports.CatalogAIManifest) int {
+	if manifest == nil {
+		return 0
+	}
+	return manifest.TotalActiveItems
+}
+
 func truncate(s string, max int) string {
 	if len(s) <= max {
 		return s

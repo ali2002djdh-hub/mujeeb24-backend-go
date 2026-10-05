@@ -52,8 +52,8 @@ func TestBatchClientEvaluateBatchSystemInstruction(t *testing.T) {
 
 	// Part 0 = system prompt.
 	part0 := sysInstr.Parts[0].Text
-	if !strings.Contains(part0, "Your job: examine the catalog items") {
-		t.Fatalf("part 0 should contain the Batch Evaluation system prompt, got: %s", part0[:min(100, len(part0))])
+	if strings.TrimSpace(part0) == "" || part0 != client.systemPrompt {
+		t.Fatalf("part 0 should equal the configured Batch Evaluation system prompt")
 	}
 
 	// Part 1 = Catalog Entity Contract.
@@ -130,8 +130,8 @@ func TestBatchClientFinalEvaluateSystemInstruction(t *testing.T) {
 	if !strings.Contains(part0, "FINAL EVALUATION mode") {
 		t.Fatalf("part 0 should contain the FINAL EVALUATION suffix, got: %s", part0[:min(100, len(part0))])
 	}
-	if !strings.Contains(part0, "Your job: examine the catalog items") {
-		t.Fatalf("part 0 should still contain the base system prompt, got: %s", part0[:min(100, len(part0))])
+	if !strings.HasPrefix(part0, client.systemPrompt) {
+		t.Fatalf("part 0 should preserve the configured base system prompt")
 	}
 
 	// Part 1 = Catalog Entity Contract.
@@ -175,8 +175,8 @@ func TestBatchClientSystemInstructionContractNotInContents(t *testing.T) {
 	}
 
 	// The prompt (part 0) must NOT contain the contract.
-	if strings.Contains(sysInstr.Parts[0].Text, "Catalog Entity Contract") {
-		t.Fatal("part 0 (prompt) should NOT contain the Catalog Entity Contract")
+	if strings.Contains(sysInstr.Parts[0].Text, "# Catalog Entity Contract") {
+		t.Fatal("part 0 must not contain the serialized Catalog Entity Contract section")
 	}
 }
 
@@ -185,4 +185,43 @@ func min(a, b int) int {
 		return a
 	}
 	return b
+}
+
+
+func TestBatchCandidateParserRejectsUnknownFields(t *testing.T) {
+	resp := batchGeminiResponse{
+		Candidates: []batchCandidate{{
+			Content: batchContent{Parts: []batchPart{{
+				Text: `{"candidates":[{"item_id":"item-1","authorized":true}]}`,
+			}}},
+		}},
+	}
+	if _, err := parseBatchCandidates(resp); err == nil {
+		t.Fatal("unknown batch candidate field must be rejected")
+	}
+}
+
+func TestFinalProposalParserRejectsUnknownFields(t *testing.T) {
+	resp := batchGeminiResponse{
+		Candidates: []batchCandidate{{
+			Content: batchContent{Parts: []batchPart{{
+				Text: `{"status":"resolved","action":"answer","response_text":"ok","requires_approval":true}`,
+			}}},
+		}},
+	}
+	if _, err := parseFinalProposal(resp); err == nil {
+		t.Fatal("unknown final proposal field must be rejected")
+	}
+}
+
+func TestBatchCandidateSchemaDisallowsAdditionalProperties(t *testing.T) {
+	schema := batchCandidateResponseSchema()
+	if schema["additionalProperties"] != false {
+		t.Fatalf("batch schema must close top-level properties: %#v", schema["additionalProperties"])
+	}
+	candidates := schema["properties"].(map[string]any)["candidates"].(map[string]any)
+	item := candidates["items"].(map[string]any)
+	if item["additionalProperties"] != false {
+		t.Fatalf("candidate schema must close additional properties: %#v", item["additionalProperties"])
+	}
 }

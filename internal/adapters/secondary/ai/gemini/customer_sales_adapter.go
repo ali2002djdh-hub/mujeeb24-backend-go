@@ -135,15 +135,10 @@ func NewGeminiCustomerSalesAdapter(base *GeminiHTTPClient, capabilities ports.Cu
 // Per contract ④ §4, Structured Output enforces the CustomerSalesProposal shape.
 // Per contract ⑧ §8, usage telemetry is captured for AI Trace.
 //
-// Per the Tool Loop spec: when the base Client has a configured
-// AICapabilityDispatcher, tool declarations are extracted from
-// Definitions() and attached to the Gemini request. If Gemini
-// responds with functionCall parts, the loop executes the capability
-// through the dispatcher (with tenant isolation — BusinessID comes
-// from the trusted caller, NOT from Gemini's args), appends the
-// functionResponse, and sends a follow-up request. The loop
-// continues until Gemini returns a final structured proposal, a
-// tool fails non-retryably, or the context deadline expires.
+// Production Customer Sales uses the Interactions API without catalog tools.
+// A generateContent function-calling compatibility path remains only for
+// isolated legacy/tool-loop tests and non-production callers that explicitly
+// inject a capability dispatcher.
 //
 // This method is the Customer Sales decision adapter; no generic AI runtime is used.
 func (c *GeminiCustomerSalesAdapter) Decide(ctx context.Context, input ports.CustomerSalesDecisionInput) (ports.CustomerSalesDecisionOutput, error) {
@@ -153,86 +148,210 @@ func (c *GeminiCustomerSalesAdapter) Decide(ctx context.Context, input ports.Cus
 	if strings.TrimSpace(input.Request.Text) == "" {
 		return ports.CustomerSalesDecisionOutput{}, errors.New("AI input text is required")
 	}
-	// Per §1-2: resolve the ACTIVE runtime configuration from cache/DB.
+
 	rc, err := c.resolveConfig(ctx)
 	if err != nil {
 		return ports.CustomerSalesDecisionOutput{}, err
 	}
-	// Per contract ④ §6: enforce LLMMaxInputCharacters on the contract path.
 	if rc.maxInputCharacters > 0 && len([]rune(input.Request.Text)) > rc.maxInputCharacters {
 		return ports.CustomerSalesDecisionOutput{}, fmt.Errorf("AI input text exceeds %d characters", rc.maxInputCharacters)
 	}
 
 	startedAt := time.Now().UTC()
+	toolDecls := c.buildToolDeclarations()
 
-	// Build the initial request.
-	reqBody := contractGeminiRequest{
-		Model:                 rc.model,
-		PreviousInteractionID: input.GeminiInteraction.PreviousInteractionID,
-		Store:                 input.GeminiInteraction.Store,
-		SystemInstruction:     c.buildContractSystemInstruction(input.EntityContractPayload),
-		Contents:              c.buildContractContents(input.Request),
-		GenerationConfig: contractGenerationConfig{
-			ResponseMimeType: "application/json",
-			ResponseSchema:   contractProposalResponseSchema(),
-			MaxOutputTokens:  rc.maxOutputTokens,
-		},
+	// Compatibility-only function-calling path. Customer Sales production does
+	// not wire catalog tools; its catalog flow is manifest -> full catalog batch.
+	// Keeping this path isolated avoids mixing Interactions and generateContent
+	// request/response schemas.
+	if len(toolDecls) > 0 {
+		reqBody := contractGeminiRequest{
+			Store:             input.GeminiInteraction.Store,
+			SystemInstruction: c.buildContractSystemInstruction(input.EntityContractPayload),
+			Contents:          c.buildContractContents(input.Request),
+			GenerationConfig: contractGenerationConfig{
+				ResponseMimeType: "application/json",
+				ResponseSchema:   contractProposalResponseSchema(),
+				MaxOutputTokens:  rc.maxOutputTokens,
+			},
+			Tools: []contractTools{{FunctionDeclarations: toolDecls}},
+		}
+		return c.runToolLoop(
+			ctx,
+			reqBody,
+			rc,
+			input,
+			input.Request.BusinessID,
+			input.Request.ConversationID,
+			input.AIRunID,
+			startedAt,
+		)
 	}
 
-	// Per the Tool Loop spec: extract tool declarations from the
-	// configured AICapabilityDispatcher. If the dispatcher has
-	// capabilities, attach them to the request so Gemini can invoke
-	// function calling.
-	toolDecls := c.buildToolDeclarations()
-	if len(toolDecls) > 0 {
-		reqBody.Tools = []contractTools{
-			{FunctionDeclarations: toolDecls},
+	return c.decideInteraction(ctx, input, rc, startedAt)
+}
+
+func (c *GeminiCustomerSalesAdapter) decideInteraction(
+	ctx context.Context,
+	input ports.CustomerSalesDecisionInput,
+	rc *resolvedAIConfig,
+	startedAt time.Time,
+) (ports.CustomerSalesDecisionOutput, error) {
+	previousID := strings.TrimSpace(input.GeminiInteraction.PreviousInteractionID)
+	if !input.GeminiInteraction.Store {
+		previousID = ""
+	}
+
+	interactionInput := buildUserPrompt(input.Request)
+	systemInstruction := c.buildContractSystemInstructionText(input.EntityContractPayload)
+	if rc.maxInputCharacters > 0 {
+		totalChars := len([]rune(interactionInput)) + len([]rune(systemInstruction))
+		if totalChars > rc.maxInputCharacters {
+			return ports.CustomerSalesDecisionOutput{}, fmt.Errorf(
+				"customer sales interaction input exceeds %d characters after context and system instruction serialization: %d",
+				rc.maxInputCharacters,
+				totalChars,
+			)
 		}
 	}
 
-	// If tools are configured, run the tool loop. Otherwise, send a
-	// single request (backward-compatible with the pre-tool-loop path).
-	businessID := input.Request.BusinessID
-	conversationID := input.Request.ConversationID
-	runID := input.AIRunID
-
-	if len(toolDecls) > 0 {
-		// Tool Loop path.
-		return c.runToolLoop(ctx, reqBody, rc, input, businessID, conversationID, runID, startedAt)
+	reqBody := interactionRequest{
+		Model:                 rc.model,
+		Input:                 interactionInput,
+		SystemInstruction:     systemInstruction,
+		PreviousInteractionID: previousID,
+		Store:                 input.GeminiInteraction.Store,
+		ResponseFormat: interactionResponseFormat{
+			Type:     "text",
+			MimeType: "application/json",
+			Schema:   contractProposalResponseSchema(),
+		},
+		GenerationConfig: interactionGenerationConfig{
+			MaxOutputTokens: rc.maxOutputTokens,
+		},
 	}
 
-	// Non-tool path (backward compatible — same as before).
-	resp, err := c.sendContractRequest(ctx, reqBody, rc)
+	resp, err := c.sendInteractionRequest(ctx, reqBody, rc)
 	if err != nil {
 		return ports.CustomerSalesDecisionOutput{}, err
+	}
+	if resp.Status != "completed" {
+		reason := resp.Status
+		if len(resp.Errors) > 0 && strings.TrimSpace(resp.Errors[0].Message) != "" {
+			reason += ": " + resp.Errors[0].Message
+		}
+		return ports.CustomerSalesDecisionOutput{}, fmt.Errorf("gemini interaction did not complete: %s", reason)
+	}
+
+	raw, err := interactionOutputText(resp)
+	if err != nil {
+		return ports.CustomerSalesDecisionOutput{}, err
+	}
+	var proposal ports.CustomerSalesProposal
+	if err := decodeStrictStructuredJSON([]byte(raw), &proposal); err != nil {
+		return ports.CustomerSalesDecisionOutput{}, fmt.Errorf("decode interaction structured output: %w", err)
 	}
 
 	latencyMs := time.Since(startedAt).Milliseconds()
-
-	proposal, err := parseContractProposal(resp)
-	if err != nil {
-		return ports.CustomerSalesDecisionOutput{}, err
-	}
-
 	return ports.CustomerSalesDecisionOutput{
 		Proposal: proposal,
 		GeminiInteraction: ports.GeminiInteractionContext{
-			PreviousInteractionID:  input.GeminiInteraction.PreviousInteractionID,
-			ResultingInteractionID: resp.InteractionID,
+			PreviousInteractionID:  previousID,
+			ResultingInteractionID: resp.ID,
 			Store:                  input.GeminiInteraction.Store,
 		},
 		Usage: ports.CustomerSalesUsageTelemetry{
-			InputTokens:         resp.UsageMetadata.PromptTokenCount,
-			CachedTokens:        resp.UsageMetadata.CachedContentTokenCount,
-			OutputTokens:        resp.UsageMetadata.CandidatesTokenCount,
+			InputTokens:         resp.Usage.TotalInputTokens,
+			CachedTokens:        resp.Usage.TotalCachedTokens,
+			OutputTokens:        resp.Usage.TotalOutputTokens,
 			Model:               rc.model,
 			EstimatedCostMicros: 0,
 			LatencyMs:           latencyMs,
-			// Per fix #1: non-tool path = exactly 1 model request.
-			ModelRequests: 1,
+			ModelRequests:       1,
 		},
 		LatencyMs: latencyMs,
 	}, nil
+}
+
+func (c *GeminiCustomerSalesAdapter) buildContractSystemInstructionText(entityContractJSON []byte) string {
+	text := prompts.CustomerSalesSystemPrompt
+	if len(entityContractJSON) > 0 {
+		text += "\n\n# Catalog Entity Contract\n" + string(entityContractJSON)
+	}
+	return text
+}
+
+func (c *GeminiCustomerSalesAdapter) sendInteractionRequest(
+	ctx context.Context,
+	reqBody interactionRequest,
+	rc *resolvedAIConfig,
+) (interactionResponse, error) {
+	buf, err := json.Marshal(reqBody)
+	if err != nil {
+		return interactionResponse{}, fmt.Errorf("marshal interaction request: %w", err)
+	}
+
+	reqCtx, cancel := context.WithTimeout(ctx, c.requestTimeout)
+	defer cancel()
+
+	url := strings.TrimRight(rc.baseURL, "/") + "/v1beta/interactions"
+	httpReq, err := http.NewRequestWithContext(reqCtx, http.MethodPost, url, bytes.NewReader(buf))
+	if err != nil {
+		return interactionResponse{}, fmt.Errorf("build interaction request: %w", err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("x-goog-api-key", rc.apiKey)
+
+	httpResp, err := c.httpClient.Do(httpReq)
+	if err != nil {
+		return interactionResponse{}, fmt.Errorf("send interaction request: %w", err)
+	}
+	defer httpResp.Body.Close()
+
+	body, err := io.ReadAll(io.LimitReader(httpResp.Body, 1<<20))
+	if err != nil {
+		return interactionResponse{}, fmt.Errorf("read interaction response: %w", err)
+	}
+	if httpResp.StatusCode >= 400 {
+		return interactionResponse{}, fmt.Errorf("gemini interactions http %d: %s", httpResp.StatusCode, string(body))
+	}
+
+	var out interactionResponse
+	if err := json.Unmarshal(body, &out); err != nil {
+		return interactionResponse{}, fmt.Errorf("unmarshal interaction response: %w", err)
+	}
+	return out, nil
+}
+
+func decodeStrictStructuredJSON(raw []byte, target any) error {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(target); err != nil {
+		return err
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		if err == nil {
+			return errors.New("structured output contains multiple JSON values")
+		}
+		return fmt.Errorf("decode trailing structured output: %w", err)
+	}
+	return nil
+}
+
+func interactionOutputText(resp interactionResponse) (string, error) {
+	for i := len(resp.Steps) - 1; i >= 0; i-- {
+		step := resp.Steps[i]
+		if step.Type != "model_output" {
+			continue
+		}
+		for _, content := range step.Content {
+			if content.Type == "text" && strings.TrimSpace(content.Text) != "" {
+				return content.Text, nil
+			}
+		}
+	}
+	return "", errors.New("gemini interaction completed without model text output")
 }
 
 // buildContractSystemInstruction builds the system_instruction content combining
@@ -333,8 +452,8 @@ func parseContractProposal(resp contractGeminiResponse) (ports.CustomerSalesProp
 		return ports.CustomerSalesProposal{}, errors.New("empty structured output text per contract ④ §4")
 	}
 	var proposal ports.CustomerSalesProposal
-	if err := json.Unmarshal([]byte(raw), &proposal); err != nil {
-		return ports.CustomerSalesProposal{}, fmt.Errorf("unmarshal structured output: %w", err)
+	if err := decodeStrictStructuredJSON([]byte(raw), &proposal); err != nil {
+		return ports.CustomerSalesProposal{}, fmt.Errorf("decode structured output: %w", err)
 	}
 	return proposal, nil
 }
@@ -345,7 +464,8 @@ func parseContractProposal(resp contractGeminiResponse) (ports.CustomerSalesProp
 // The contract response schema is shared by contract-aligned AI calls.
 func contractProposalResponseSchema() map[string]any {
 	return map[string]any{
-		"type": "object",
+		"type":                 "object",
+		"additionalProperties": false,
 		"properties": map[string]any{
 			"status": map[string]any{
 				"type": "string",
@@ -367,10 +487,19 @@ func contractProposalResponseSchema() map[string]any {
 				},
 			},
 			"response_text": map[string]any{"type": "string"},
+			"routing_reason": map[string]any{
+				"type": "string",
+				"enum": []string{
+					string(ports.CustomerSalesRoutingReasonSubscriptionActivation),
+					string(ports.CustomerSalesRoutingReasonCustomerRequestedHuman),
+					string(ports.CustomerSalesRoutingReasonOther),
+				},
+			},
 			"selected": map[string]any{
 				"type": "array",
 				"items": map[string]any{
-					"type": "object",
+					"type":                 "object",
+					"additionalProperties": false,
 					"properties": map[string]any{
 						"item_id":    map[string]any{"type": "string"},
 						"variant_id": map[string]any{"type": "string"},
@@ -386,9 +515,8 @@ func contractProposalResponseSchema() map[string]any {
 
 // contractGeminiRequest is the Interactions API request body.
 type contractGeminiRequest struct {
-	Model                 string                   `json:"model"`
-	PreviousInteractionID string                   `json:"previous_interaction_id,omitempty"`
-	Store                 bool                     `json:"store"`
+	PreviousInteractionID string                   `json:"-"`
+	Store                 bool                     `json:"store,omitempty"`
 	SystemInstruction     *contractContent         `json:"systemInstruction,omitempty"`
 	Contents              []contractContent        `json:"contents"`
 	GenerationConfig      contractGenerationConfig `json:"generationConfig"`
@@ -449,6 +577,56 @@ type contractUsageMetadata struct {
 	CandidatesTokenCount    int `json:"candidatesTokenCount,omitempty"`
 	CachedContentTokenCount int `json:"cachedContentTokenCount,omitempty"`
 	TotalTokenCount         int `json:"totalTokenCount,omitempty"`
+}
+
+type interactionRequest struct {
+	Model                 string                      `json:"model"`
+	Input                 string                      `json:"input"`
+	SystemInstruction     string                      `json:"system_instruction,omitempty"`
+	PreviousInteractionID string                      `json:"previous_interaction_id,omitempty"`
+	Store                 bool                        `json:"store"`
+	ResponseFormat        interactionResponseFormat   `json:"response_format"`
+	GenerationConfig      interactionGenerationConfig `json:"generation_config,omitempty"`
+}
+
+type interactionResponseFormat struct {
+	Type     string         `json:"type"`
+	MimeType string         `json:"mime_type,omitempty"`
+	Schema   map[string]any `json:"schema,omitempty"`
+}
+
+type interactionGenerationConfig struct {
+	MaxOutputTokens int `json:"max_output_tokens,omitempty"`
+}
+
+type interactionResponse struct {
+	ID     string            `json:"id"`
+	Status string            `json:"status"`
+	Steps  []interactionStep `json:"steps"`
+	Usage  interactionUsage  `json:"usage"`
+	Errors []interactionError `json:"errors,omitempty"`
+}
+
+type interactionStep struct {
+	Type    string               `json:"type"`
+	Content []interactionContent `json:"content,omitempty"`
+}
+
+type interactionContent struct {
+	Type string `json:"type"`
+	Text string `json:"text,omitempty"`
+}
+
+type interactionUsage struct {
+	TotalInputTokens  int `json:"total_input_tokens,omitempty"`
+	TotalCachedTokens int `json:"total_cached_tokens,omitempty"`
+	TotalOutputTokens int `json:"total_output_tokens,omitempty"`
+	TotalTokens       int `json:"total_tokens,omitempty"`
+}
+
+type interactionError struct {
+	Code    string `json:"code,omitempty"`
+	Message string `json:"message,omitempty"`
 }
 
 // Compile-time assertion: GeminiCustomerSalesAdapter implements ports.CustomerSalesDecisionPort.

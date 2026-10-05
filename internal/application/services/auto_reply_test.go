@@ -176,6 +176,7 @@ func TestAutoReplyServicePersistsDecisionAndEnqueuesAnswerAtomically(t *testing.
 		return value
 	}
 
+	service.Validation = allowAllValidationPipeline()
 	result, err := service.Handle(context.Background(), commands.AutoReplyCommand{Meta: commands.CommandMeta{Actor: commands.ActorContext{BusinessID: "business-1"}, CorrelationID: "not-a-uuid"}, ConversationID: "conversation-1", SourceMessageReference: "inbound-1", Text: "مرحبا", Channel: "facebook", ProviderRef: "socialapi"})
 	if err != nil {
 		t.Fatalf("Handle: %v", err)
@@ -222,6 +223,7 @@ func TestAutoReplyServiceDoesNotEnqueueNonAnswerDecision(t *testing.T) {
 		outbox,
 		fakeTransactionManager{},
 	)
+	service.Validation = allowAllValidationPipeline()
 	result, err := service.Handle(context.Background(), commands.AutoReplyCommand{Meta: commands.CommandMeta{Actor: commands.ActorContext{BusinessID: "business-1"}}, ConversationID: "conversation-1", SourceMessageReference: "inbound-1", Text: "أحتاج مساعدة", Channel: "facebook", ProviderRef: "socialapi"})
 	if err != nil {
 		t.Fatalf("Handle: %v", err)
@@ -246,6 +248,7 @@ func TestAutoReplyServiceEnqueuesAllowedClarification(t *testing.T) {
 	service.Subscriptions = &stubSubscriptionsRepo{items: []ports.SubscriptionRecord{{ID: "sub-1", BusinessID: "business-1", Status: "ACTIVE"}}}
 	service.AIPricing = &stubPricingRepoAlwaysFail{}
 	service.NewID = func() string { return "test-id" }
+	service.Validation = allowAllValidationPipeline()
 	result, err := service.Handle(context.Background(), commands.AutoReplyCommand{Meta: commands.CommandMeta{Actor: commands.ActorContext{BusinessID: "business-1"}}, ConversationID: "conversation-1", SourceMessageReference: "inbound-1", Text: "كم سعرها؟", Channel: "whatsapp", ProviderRef: "socialapi"})
 	if err != nil {
 		t.Fatalf("Handle: %v", err)
@@ -284,6 +287,45 @@ type stubCustomerSalesContextBuilder struct {
 
 func (s stubCustomerSalesContextBuilder) Build(context.Context, ports.CustomerSalesContextInput) (ports.CustomerSalesContext, error) {
 	return s.context, nil
+}
+
+type allowAllReferenceValidator struct{}
+
+func (allowAllReferenceValidator) ValidateItemReference(context.Context, string, string, []string) error {
+	return nil
+}
+func (allowAllReferenceValidator) ValidateVariantReference(context.Context, string, string, []string) error {
+	return nil
+}
+func (allowAllReferenceValidator) ValidateOfferReference(context.Context, string, string, []string) error {
+	return nil
+}
+
+type allowAllTenantValidator struct{}
+
+func (allowAllTenantValidator) ValidateItemOwnership(context.Context, string, string) error {
+	return nil
+}
+func (allowAllTenantValidator) ValidateVariantOwnership(context.Context, string, string) error {
+	return nil
+}
+func (allowAllTenantValidator) ValidateOfferOwnership(context.Context, string, string) error {
+	return nil
+}
+
+type allowAllCustomerSalesPolicy struct{}
+
+func (allowAllCustomerSalesPolicy) Evaluate(context.Context, ports.CustomerSalesProposal, *ports.CustomerSalesContext) ports.CustomerSalesPolicyDecision {
+	return ports.CustomerSalesPolicyDecision{Decision: "allowed", Reason: "test policy"}
+}
+
+func allowAllValidationPipeline() *ValidationPipeline {
+	return NewValidationPipeline(
+		allowAllReferenceValidator{},
+		allowAllTenantValidator{},
+		allowAllCustomerSalesPolicy{},
+		nil,
+	)
 }
 
 type stubStateRepository struct {
@@ -334,6 +376,7 @@ func TestAutoReplyServiceEnqueuesGeneralAnswerAfterFocus(t *testing.T) {
 	service.Subscriptions = &stubSubscriptionsRepo{items: []ports.SubscriptionRecord{{ID: "sub-1", BusinessID: "business-1", Status: "ACTIVE"}}}
 	service.AIPricing = &stubPricingRepoAlwaysFail{}
 	service.NewID = func() string { return "test-id" }
+	service.Validation = allowAllValidationPipeline()
 	result, err := service.Handle(context.Background(), commands.AutoReplyCommand{Meta: commands.CommandMeta{Actor: commands.ActorContext{BusinessID: "business-1"}}, ConversationID: "conversation-1", SourceMessageReference: "inbound-1", Text: "السلام عليكم، ايش الباقات الي عندكم؟", Channel: "whatsapp", ProviderRef: "socialapi"})
 	if err != nil {
 		t.Fatalf("Handle: %v", err)
@@ -430,6 +473,7 @@ func TestAutoReplyServiceHandlesDraftOrder(t *testing.T) {
 	service.Subscriptions = &stubSubscriptionsRepo{items: []ports.SubscriptionRecord{{ID: "sub-1", BusinessID: "business-1", Status: "ACTIVE"}}}
 	service.AIPricing = &stubPricingRepoAlwaysFail{}
 	service.NewID = func() string { return "test-id" }
+	service.Validation = allowAllValidationPipeline()
 	result, err := service.Handle(context.Background(), commands.AutoReplyCommand{Meta: commands.CommandMeta{Actor: commands.ActorContext{BusinessID: "business-1"}}, ConversationID: "conversation-1", SourceMessageReference: "inbound-1", Text: "أريد شراء هذا", Channel: "whatsapp", ProviderRef: "socialapi"})
 	if err != nil {
 		t.Fatalf("Handle: %v", err)
@@ -462,6 +506,7 @@ func TestAutoReplyServiceHandlesDraftLead(t *testing.T) {
 	service.Subscriptions = &stubSubscriptionsRepo{items: []ports.SubscriptionRecord{{ID: "sub-1", BusinessID: "business-1", Status: "ACTIVE"}}}
 	service.AIPricing = &stubPricingRepoAlwaysFail{}
 	service.NewID = func() string { return "test-id" }
+	service.Validation = allowAllValidationPipeline()
 	result, err := service.Handle(context.Background(), commands.AutoReplyCommand{Meta: commands.CommandMeta{Actor: commands.ActorContext{BusinessID: "business-1"}}, ConversationID: "conversation-1", SourceMessageReference: "inbound-1", Text: "مهتم بالخدمة", Channel: "whatsapp", ProviderRef: "socialapi"})
 	if err != nil {
 		t.Fatalf("Handle: %v", err)

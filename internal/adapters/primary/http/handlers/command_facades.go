@@ -578,7 +578,7 @@ func optionalVariantID(v *contract.UUID) *commands.VariantID {
 func attributeDefinitions(values []contract.AttributeDefinitionInput) []commands.AttributeDefinition {
 	result := make([]commands.AttributeDefinition, 0, len(values))
 	for _, value := range values {
-		result = append(result, commands.AttributeDefinition{Key: value.Key, Label: value.Label, DataType: value.DataType, Required: value.Required, Searchable: value.Searchable, DisplayOrder: value.DisplayOrder})
+		result = append(result, commands.AttributeDefinition{Key: value.Key, Label: value.Label, DataType: value.DataType, Required: value.Required, ValidationRules: value.ValidationRules, DisplayOrder: value.DisplayOrder})
 	}
 	return result
 }

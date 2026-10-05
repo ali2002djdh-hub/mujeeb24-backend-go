@@ -400,12 +400,12 @@ type CreateAttributeSchemaRequest struct {
 	Definitions []AttributeDefinitionInput `json:"definitions"`
 }
 type AttributeDefinitionInput struct {
-	Key          string `json:"key"`
-	Label        string `json:"label"`
-	DataType     string `json:"data_type"`
-	Required     bool   `json:"required"`
-	Searchable   bool   `json:"searchable"`
-	DisplayOrder int    `json:"display_order"`
+	Key             string         `json:"key"`
+	Label           string         `json:"label"`
+	DataType        string         `json:"data_type"`
+	Required        bool           `json:"required"`
+	ValidationRules map[string]any `json:"validation_rules,omitempty"`
+	DisplayOrder    int            `json:"display_order"`
 }
 type CreateCatalogItemRequest struct {
 	AttributeSchemaID    *UUID          `json:"attribute_schema_id,omitempty"`

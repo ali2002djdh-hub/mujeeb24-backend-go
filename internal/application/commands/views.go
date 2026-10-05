@@ -87,13 +87,13 @@ type CustomerView struct {
 	ResourceVersion ResourceVersion
 }
 type AttributeDefinitionView struct {
-	ID           ID
-	Key          string
-	Label        string
-	DataType     string
-	Required     bool
-	Searchable   bool
-	DisplayOrder int
+	ID              ID
+	Key             string
+	Label           string
+	DataType        string
+	Required        bool
+	ValidationRules map[string]any
+	DisplayOrder    int
 }
 type AttributeSchemaView struct {
 	ID          AttributeSchemaID

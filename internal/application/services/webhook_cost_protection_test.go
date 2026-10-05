@@ -82,3 +82,19 @@ func TestAICostProtectionDoesNotBlockHumanReply(t *testing.T) {
 		t.Fatalf("expected realtime event published (Human Reply unaffected — merchant can see customer message + reply manually), got 0 publishes")
 	}
 }
+
+func TestAICostProtectionMissingCheckerBlocksAutoReply(t *testing.T) {
+	autoReply := newAutoReplyHandler()
+	service := resolvedSocialWebhookService(&providerInboundStore{result: ports.ProviderInboundResult{BusinessID: "business-1", CustomerID: "customer-1", ConversationID: "conversation-missing-protection", CommunicationMessageID: "message-missing-protection"}})
+	service.AutoReply = autoReply
+	service.AICostProtectionChecker = nil
+
+	body := []byte(`{"event":"dm.received","data":{"id":"event-cost-missing","type":"dm","platform":"instagram","account_id":"account-1","conversation_id":"conversation-missing-protection","author":{"id":"customer-1"},"content":{"text":"hello"}}}`)
+	result, err := service.Handle(context.Background(), signedSocialCommand(t, body))
+	if err != nil || !result.Accepted {
+		t.Fatalf("Handle: err=%v result=%#v", err, result)
+	}
+	if autoReply.getCalls() != 0 {
+		t.Fatalf("expected 0 AutoReply calls when cost protection checker is missing, got %d", autoReply.getCalls())
+	}
+}

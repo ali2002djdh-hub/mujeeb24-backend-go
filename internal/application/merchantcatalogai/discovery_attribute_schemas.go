@@ -73,7 +73,6 @@ func (c listAttributeSchemasCapability) Execute(ctx context.Context, execCtx Mer
 				"label":            definition.Label,
 				"data_type":        definition.DataType,
 				"required":         definition.Required,
-				"searchable":       definition.Searchable,
 				"validation_rules": rules,
 				"display_order":    definition.DisplayOrder,
 			})

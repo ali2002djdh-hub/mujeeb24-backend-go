@@ -4,7 +4,7 @@
 //
 // Per contract ① §1, the Projection is a Read Model for AI ONLY, built 100%
 // on the Catalog Contract (⑤). It is NOT a Domain Entity, NOT a Catalog
-// Contract replacement, NOT a Search Index.
+// Contract replacement. It is only a provider-facing read model.
 //
 // Per contract ① §2, only the AttributeSchemas USED by the Items in the
 // Projection are sent. We do NOT send unused schemas.
@@ -13,8 +13,8 @@
 // items[] reference it by (attribute_schema_id, attribute_schema_version).
 //
 // Per contract ① §5, the Projection does NOT contain: business_id, SQL,
-// database metadata, created_at, updated_at, search_query, semantic_search,
-// matching logic, or ranking logic.
+// database metadata, created_at, or updated_at. The projection contains only
+// catalog facts and relationships needed by the model.
 //
 // Per contract ① §6:
 //   Mujeeb reads the real Catalog → builds Projection → enforces Tenant
@@ -26,15 +26,24 @@ package services
 
 // CatalogAIProjection is the contract ① §1 Read Model sent to Gemini.
 //
-// The Projection contains exactly two top-level arrays:
+// The Projection contains three top-level arrays:
 //
-//	attribute_schemas[] — the schemas actually used by items[] (contract ① §2)
-//	items[]              — the actual catalog items with nested variants + offers
+//	catalogs[]           — catalog identity/meaning for catalog_id references
+//	attribute_schemas[]  — schemas actually used by items[]
+//	items[]              — actual catalog items with nested variants + offers
 //
 // The Projection is NOT a Domain Entity. It is a transport shape.
 type CatalogAIProjection struct {
+	Catalogs         []CatalogAICatalog         `json:"catalogs,omitempty"`
 	AttributeSchemas []CatalogAIAttributeSchema `json:"attribute_schemas,omitempty"`
 	Items            []CatalogAIItem            `json:"items,omitempty"`
+}
+
+type CatalogAICatalog struct {
+	ID          string  `json:"id"`
+	Name        string  `json:"name"`
+	Description *string `json:"description,omitempty"`
+	Status      string  `json:"status"`
 }
 
 // CatalogAIAttributeSchema is contract ① §1 — one schema with its definitions.
@@ -53,7 +62,6 @@ type CatalogAIAttributeDefinition struct {
 	Label           string         `json:"label"`
 	DataType        string         `json:"data_type"`
 	IsRequired      bool           `json:"is_required"`
-	IsSearchable    bool           `json:"is_searchable"`
 	ValidationRules map[string]any `json:"validation_rules,omitempty"`
 	DisplayOrder    int            `json:"display_order"`
 }
@@ -80,8 +88,9 @@ type CatalogAIItem struct {
 
 // CatalogAIVariant is contract ① §1 — one variant under a CatalogAIItem.
 type CatalogAIVariant struct {
-	ID         string         `json:"id"`
-	Name       string         `json:"name"`
+	ID            string         `json:"id"`
+	CatalogItemID string         `json:"catalog_item_id"`
+	Name          string         `json:"name"`
 	Attributes map[string]any `json:"attributes,omitempty"`
 	Status     string         `json:"status"`
 }
@@ -92,6 +101,7 @@ type CatalogAIVariant struct {
 // fields so Gemini can understand the commercial truth without guessing.
 type CatalogAIOffer struct {
 	ID                      string  `json:"id"`
+	CatalogItemID           string  `json:"catalog_item_id"`
 	VariantID               *string `json:"variant_id,omitempty"`
 	Name                    string  `json:"name"`
 	PricingMode             string  `json:"pricing_mode"`

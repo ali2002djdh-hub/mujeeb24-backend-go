@@ -15,6 +15,7 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Ammar777782439/mujeeb24-backend-go/internal/application/ports"
 )
@@ -95,5 +96,45 @@ func TestCustomerSalesOfferEvidenceJSONSerialization(t *testing.T) {
 	}
 	if val != "available" {
 		t.Fatalf("expected availability_status=\"available\", got: %v", val)
+	}
+}
+
+
+func TestCustomerSalesOfferEvidenceSerializesCommercialProvenanceWhenPresent(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0).UTC()
+	ctx := customerSalesPromptContext{
+		OfferEvidence: []ports.CustomerSalesOfferEvidence{{
+			Reference:               "offer-001",
+			Name:                    "Test Offer",
+			PricingMode:             "fixed",
+			Amount:                  "3500",
+			Currency:                "SAR",
+			PricingUnit:             "unit",
+			PriceSource:             "merchant",
+			PriceVerificationStatus: "verified",
+			PriceCheckedAt:          &now,
+			AvailabilityMode:        "stock",
+			AvailabilityStatus:      "available",
+			AvailabilityValidUntil:  &now,
+			FulfillmentMode:         "delivery",
+			Status:                  "active",
+		}},
+	}
+
+	encoded, err := json.Marshal(ctx)
+	if err != nil {
+		t.Fatalf("json.Marshal failed: %v", err)
+	}
+	jsonStr := string(encoded)
+	for _, key := range []string{
+		`"price_verification_status"`,
+		`"price_checked_at"`,
+		`"availability_mode"`,
+		`"availability_valid_until"`,
+		`"fulfillment_mode"`,
+	} {
+		if !strings.Contains(jsonStr, key) {
+			t.Fatalf("expected %s in serialized offer evidence: %s", key, jsonStr)
+		}
 	}
 }

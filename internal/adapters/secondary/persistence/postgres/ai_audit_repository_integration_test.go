@@ -279,12 +279,23 @@ func TestAutoReplyVerticalSliceAgainstPostgres(t *testing.T) {
 		_, _ = adapter.Pool().Exec(cleanupCtx, `DELETE FROM channel_connections WHERE business_id = $1::uuid`, businessID)
 		_, _ = adapter.Pool().Exec(cleanupCtx, `DELETE FROM conversations WHERE business_id = $1::uuid`, businessID)
 		_, _ = adapter.Pool().Exec(cleanupCtx, `DELETE FROM customers WHERE business_id = $1::uuid`, businessID)
+		_, _ = adapter.Pool().Exec(cleanupCtx, `DELETE FROM business_policies WHERE business_id = $1::uuid`, businessID)
 		_, _ = adapter.Pool().Exec(cleanupCtx, `DELETE FROM businesses WHERE id = $1::uuid`, businessID)
 	}
 	defer cleanup()
 
 	if _, err := adapter.Pool().Exec(ctx, `INSERT INTO businesses (id, name, slug, status, vertical_type, timezone, default_currency, locale, created_at, updated_at) VALUES ($1::uuid, 'Auto Reply Business', $1, 'active', 'retail', 'Asia/Aden', 'YER', 'ar-YE', $2, $2)`, businessID, base); err != nil {
 		t.Fatalf("insert business: %v", err)
+	}
+	if _, err := adapter.Pool().Exec(ctx, `
+		INSERT INTO business_policies (
+			business_id, ai_mode, default_human_review, allow_auto_reply,
+			allow_auto_lead_creation, allow_auto_transaction_draft,
+			allow_auto_confirmation, created_at, updated_at
+		)
+		VALUES ($1::uuid, 'restricted_auto', false, true, true, true, true, $2, $2)
+	`, businessID, base); err != nil {
+		t.Fatalf("insert business policy: %v", err)
 	}
 	if _, err := adapter.Pool().Exec(ctx, `INSERT INTO customers (id, business_id, profile, contact_points, status, created_at, updated_at) VALUES ($1::uuid, $2::uuid, '{}'::jsonb, '[]'::jsonb, 'active', $3, $3)`, customerID, businessID, base); err != nil {
 		t.Fatalf("insert customer: %v", err)
@@ -304,6 +315,19 @@ func TestAutoReplyVerticalSliceAgainstPostgres(t *testing.T) {
 	outboundRepo := NewOutboundMessageRepository(adapter)
 	outboxRepo := NewPostgresOutboxStore(adapter)
 	service := services.NewAutoReplyService(legacyAutoReplyDecisionStub{}, decisionRepo, referenceRepo, outboundRepo, outboxRepo, adapter)
+	service.Validation = services.NewValidationPipeline(
+		NewPostgresReferenceValidator(adapter),
+		NewPostgresTenantValidator(adapter),
+		NewPostgresCustomerSalesPolicyEvaluator(NewBusinessRepository(adapter)),
+		nil,
+	)
+	service.CustomerSalesContextBuilder = services.NewAutoReplyContextBuilder(
+		NewBusinessRepository(adapter),
+		NewConversationRepository(adapter),
+		NewCustomerRepository(adapter),
+		NewCatalogRepository(adapter),
+		NewMessageRepository(adapter),
+	)
 	service.AIUsage = noopAIUsageRepository{}
 	service.Subscriptions = activeSubscriptionStub{}
 	result, err := service.Handle(ctx, commands.AutoReplyCommand{Meta: commands.CommandMeta{Actor: commands.ActorContext{BusinessID: commands.BusinessID(businessID)}}, ConversationID: commands.ConversationID(conversationID), SourceMessageReference: "inbound-success", Text: "مرحبا", Channel: "facebook", ProviderRef: "socialapi"})
@@ -328,6 +352,19 @@ func TestAutoReplyVerticalSliceAgainstPostgres(t *testing.T) {
 	}
 
 	failingService := services.NewAutoReplyService(legacyAutoReplyDecisionStub{}, decisionRepo, referenceRepo, outboundRepo, failingEnqueueOutbox{OutboxStore: outboxRepo}, adapter)
+	failingService.Validation = services.NewValidationPipeline(
+		NewPostgresReferenceValidator(adapter),
+		NewPostgresTenantValidator(adapter),
+		NewPostgresCustomerSalesPolicyEvaluator(NewBusinessRepository(adapter)),
+		nil,
+	)
+	failingService.CustomerSalesContextBuilder = services.NewAutoReplyContextBuilder(
+		NewBusinessRepository(adapter),
+		NewConversationRepository(adapter),
+		NewCustomerRepository(adapter),
+		NewCatalogRepository(adapter),
+		NewMessageRepository(adapter),
+	)
 	failingService.AIUsage = noopAIUsageRepository{}
 	failingService.Subscriptions = activeSubscriptionStub{}
 	if _, err := failingService.Handle(ctx, commands.AutoReplyCommand{Meta: commands.CommandMeta{Actor: commands.ActorContext{BusinessID: commands.BusinessID(businessID)}}, ConversationID: commands.ConversationID(conversationID), SourceMessageReference: "inbound-rollback", Text: "رسالة ثانية", Channel: "facebook", ProviderRef: "socialapi"}); err == nil {
